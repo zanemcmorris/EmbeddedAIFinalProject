@@ -14,6 +14,8 @@ limitations under the License.
 // #undef ARDUINO
 // #endif
 
+#define IMU_ADDR 0x6a
+
 #include <Arduino_LSM9DS1.h>
 #include <Adafruit_LSM6DSOX.h>
 #include <ArduinoBLE.h>
@@ -138,7 +140,15 @@ void SetupIMU() {
   acceleration_sample_rate = 104;
   gyroscope_sample_rate = 104;
 
-  Wire.write()
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(0x06); // FIFO_CTRL1
+  Wire.write(200); // Fifo size = 200
+  Wire.endTransmission();
+
+  Wire.beginTransmission(IMU_ADDR);
+  Wire.write(0x0A); // FIFO_CTRL5
+  Wire.write(0x26); // Fifo odr = 104, mode = (110) Continuous
+  Wire.endTransmission();
 
 }
 
@@ -147,7 +157,7 @@ int ReadAccelerometerAndGyroscope(int* new_accelerometer_samples, int* new_gyros
   *new_accelerometer_samples = 0;
   *new_gyroscope_samples = 0;
   // Loop through new samples and add to buffer
-  // while (lsm6ds3trc.accelerationAvailable()) {
+  while (lsm6ds3trc.accelerationAvailable()) {
     const int gyroscope_index = (gyroscope_data_index % gyroscope_data_length);
     gyroscope_data_index += 3;
     float* current_gyroscope_data = &gyroscope_data[gyroscope_index];
@@ -170,14 +180,14 @@ int ReadAccelerometerAndGyroscope(int* new_accelerometer_samples, int* new_gyros
     }
     *new_accelerometer_samples += 1;
     Serial.printf("Got %d samples\n", *new_accelerometer_samples);
-  // }
+  }
 }
 
 int ReadGyroscope() {
   // Keep track of whether we stored any new data
   int new_samples = 0;
   // Loop through new samples and add to buffer
-  // while (lsm6ds3trc.gyroscopeAvailable()) {
+  while (lsm6ds3trc.gyroscopeAvailable()) {
     const int index = (gyroscope_data_index % gyroscope_data_length);
     gyroscope_data_index += 3;
     float* data = &gyroscope_data[index];
@@ -187,7 +197,7 @@ int ReadGyroscope() {
       // break;
     }
     new_samples += 1;
-  // }
+  }
   return new_samples;
 }
 
@@ -601,7 +611,6 @@ void setup() {
   // incur some penalty in code space for op implementations that are not
   // needed by this graph.
   static tflite::MicroMutableOpResolver<4> micro_op_resolver;  // NOLINT
-  // static tflite::AllOpsResolver micro_op_resolver;
 
   micro_op_resolver.AddConv2D();
   micro_op_resolver.AddMean();
