@@ -690,6 +690,9 @@ void loop() {
 
   Serial.println("here!");
   if (done_just_triggered) {
+    // TODO: What is done_just_triggered
+
+    // 
     RasterizeStroke(stroke_points, *stroke_transmit_length, 0.6f, 0.6f, raster_width, raster_height, raster_buffer);
     for (int y = 0; y < raster_height; ++y) {
       char line[raster_width + 1];
