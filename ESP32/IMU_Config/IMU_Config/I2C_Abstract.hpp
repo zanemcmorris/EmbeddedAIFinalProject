@@ -29,12 +29,12 @@
 #define REG_SLV2_CONFIG 0x1B
 #define REG_SLV3_CONFIG 0x1D
 
-#define REG_OUTX_L_A  0x28
-#define REG_OUTX_H_A  0x29
-#define REG_OUTY_L_A  0x2A
-#define REG_OUTY_H_A  0x2B
-#define REG_OUTZ_L_A  0x2C
-#define REG_OUTZ_H_A  0x2D
+#define REG_OUTX_L_A 0x28
+#define REG_OUTX_H_A 0x29
+#define REG_OUTY_L_A 0x2A
+#define REG_OUTY_H_A 0x2B
+#define REG_OUTZ_L_A 0x2C
+#define REG_OUTZ_H_A 0x2D
 
 
 // ---- helpers for raw I2C register access ----

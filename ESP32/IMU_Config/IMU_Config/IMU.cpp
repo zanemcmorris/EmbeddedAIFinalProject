@@ -1,13 +1,18 @@
 #include "IMU.hpp"
 
+static SensorType getSensorTypeFromTag(uint8_t tag);
+static CompressionType getCompressionTypeFromTag(uint8_t tag);
+static void get_diff_2x(int16_t diff[6], const uint8_t input[6]);
+static void get_diff_3x(int16_t diff[9], const uint8_t input[6]);
+
 bool isGyroData(uint8_t rawTag) {
-  uint8_t tag = rawTag & 0x1F;
+  uint8_t tag = (rawTag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
   switch (tag) {
-    case 0x01:  // GYRO_NC
-    case 0x0A:  // GYRO_NC_T_2
-    case 0x0B:  // GYRO_NC_T_1
-    case 0x0C:  // GYRO_2xC
-    case 0x0D:  // GYRO_3xC
+    case TAG_GY:
+    case TAG_GY_UNCOMPRESSED_T_2:
+    case TAG_GY_UNCOMPRESSED_T_1:
+    case TAG_GY_COMPRESSED_2X:
+    case TAG_GY_COMPRESSED_3X:
       return true;
     default:
       return false;
@@ -15,13 +20,13 @@ bool isGyroData(uint8_t rawTag) {
 }
 
 bool isAccelData(uint8_t rawTag) {
-  uint8_t tag = rawTag & 0x1F;
+  uint8_t tag = (rawTag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
   switch (tag) {
-    case 0x02:  // ACC_NC
-    case 0x06:  // ACC_NC_T_2
-    case 0x07:  // ACC_NC_T_1
-    case 0x08:  // ACC_2xC
-    case 0x09:  // ACC_3xC
+    case TAG_XL:
+    case TAG_XL_UNCOMPRESSED_T_2:
+    case TAG_XL_UNCOMPRESSED_T_1:
+    case TAG_XL_COMPRESSED_2X:
+    case TAG_XL_COMPRESSED_3X:
       return true;
     default:
       return false;
@@ -158,164 +163,164 @@ size_t decodeFifoWord(uint8_t rawTag,
                       const uint8_t data[6],
                       fifoSample_t *out,
                       size_t maxOut,
-                    FifoDecompState& decomp) {
+                      FifoDecompState &decomp)
+{
   if (maxOut == 0) return 0;
 
-  uint8_t tag = rawTag & 0x1F;
+  // Extract sensor/compression tag from upper 5 bits
+  uint8_t tag = (rawTag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
 
-  bool isAccel = isAccelData(tag);
-  bool isGyro = isGyroData(tag);
+  // Figure out sensor and compression type
+  SensorType sensor = getSensorTypeFromTag(tag);
+  CompressionType comp = getCompressionTypeFromTag(tag);
 
-  if (!isAccel && !isGyro)
+  if (sensor == SENSOR_NONE) {
+    // Temperature, timestamps, ODR change, etc. → ignore for now
     return 0;
+  }
 
-  // ------------ Select State ------------
-  int16_t &S_last_x = isAccel ? decomp.ax_last : decomp.gx_last;
-  int16_t &S_last_y = isAccel ? decomp.ay_last : decomp.gy_last;
-  int16_t &S_last_z = isAccel ? decomp.az_last : decomp.gz_last;
-  bool &have = isAccel ? decomp.have_accel : decomp.have_gyro;
+  // Select the "last" sample state for this sensor
+  int16_t *last_x, *last_y, *last_z;
+  bool    *have_last;
 
-  // ------------ 1) NC / NC_T1 / NC_T2 ------------
-  if (tag == 0x02 || tag == 0x06 || tag == 0x07 || tag == 0x01 || tag == 0x0A || tag == 0x0B) {
+  static_assert(sizeof(FifoDecompState::ax_last) == sizeof(int16_t), "field types");
+
+  if (sensor == SENSOR_ACCEL) {
+    last_x    = &decomp.ax_last;
+    last_y    = &decomp.ay_last;
+    last_z    = &decomp.az_last;
+    have_last = &decomp.have_accel;
+  } else { // SENSOR_GYRO
+    last_x    = &decomp.gx_last;
+    last_y    = &decomp.gy_last;
+    last_z    = &decomp.gz_last;
+    have_last = &decomp.have_gyro;
+  }
+
+  // ------------------------------------------------------------------
+  // 1) Uncompressed cases: NC, NC_T1, NC_T2
+  // (For your purposes we treat them the same: just a plain sample.)
+  // ------------------------------------------------------------------
+  if (comp == COMP_NC || comp == COMP_NC_T1 || comp == COMP_NC_T2) {
+
     if (maxOut < 1) return 0;
 
-    int16_t x = (data[1] << 8) | data[0];
-    int16_t y = (data[3] << 8) | data[2];
-    int16_t z = (data[5] << 8) | data[4];
+    int16_t x = (int16_t)((data[1] << 8) | data[0]);
+    int16_t y = (int16_t)((data[3] << 8) | data[2]);
+    int16_t z = (int16_t)((data[5] << 8) | data[4]);
 
-    // NC gives us a new fully-known LAST sample
-    S_last_x = x;
-    S_last_y = y;
-    S_last_z = z;
-    have = true;
+    *last_x = x;
+    *last_y = y;
+    *last_z = z;
+    *have_last = true;
 
     out[0].tag = rawTag;
-    out[0].x = x;
-    out[0].y = y;
-    out[0].z = z;
+    out[0].x   = x;
+    out[0].y   = y;
+    out[0].z   = z;
+
     return 1;
   }
 
-  // ------------ If compressed but no previous sample → treat as NC -----------
-  if (!have) {
-    if (maxOut < 1) return 0;
-
-    int16_t x = (data[1] << 8) | data[0];
-    int16_t y = (data[3] << 8) | data[2];
-    int16_t z = (data[5] << 8) | data[4];
-
-    S_last_x = x;
-    S_last_y = y;
-    S_last_z = z;
-    have = true;
-
-    out[0].tag = rawTag;
-    out[0].x = x;
-    out[0].y = y;
-    out[0].z = z;
-    return 1;
+  // We shouldn't ever see compressed data before having a base sample
+  if (!*have_last) {
+    // No base yet: we can't decompress this block safely
+    return 0;
   }
 
-  // =====================================================================
-  // 2) 2×C BLOCK
-  // =====================================================================
-  if (tag == 0x08 || tag == 0x0C)  // accel / gyro 2×C
-  {
+  // ------------------------------------------------------------------
+  // 2) 2×C compressed block → 2 samples
+  // ------------------------------------------------------------------
+  if (comp == COMP_2X) {
     if (maxOut < 2) return 0;
 
-    // Read signed diffs
-    int16_t d_i2_x = (int8_t)data[0];
-    int16_t d_i2_y = (int8_t)data[1];
-    int16_t d_i2_z = (int8_t)data[2];
+    int16_t diff[6];
+    get_diff_2x(diff, data);
 
-    int16_t d_i1_x = (int8_t)data[3];
-    int16_t d_i1_y = (int8_t)data[4];
-    int16_t d_i1_z = (int8_t)data[5];
+    // ST logic:
+    // sample0 = last + diff[0..2]
+    // sample1 = sample0 + diff[3..5]
+    int16_t x0 = *last_x + diff[0];
+    int16_t y0 = *last_y + diff[1];
+    int16_t z0 = *last_z + diff[2];
 
-    // Base = S(i) = S_last_x/y/z — confirmed by ST
-    int16_t Si_x = S_last_x;
-    int16_t Si_y = S_last_y;
-    int16_t Si_z = S_last_z;
+    int16_t x1 = x0 + diff[3];
+    int16_t y1 = y0 + diff[4];
+    int16_t z1 = z0 + diff[5];
 
-    // Reconstruct:
-    int16_t Sim1_x = Si_x + d_i1_x;
-    int16_t Sim1_y = Si_y + d_i1_y;
-    int16_t Sim1_z = Si_z + d_i1_z;
+    // Oldest → newest
+    out[0].tag = rawTag;
+    out[0].x   = x0;
+    out[0].y   = y0;
+    out[0].z   = z0;
 
-    int16_t Sim2_x = Sim1_x + d_i2_x;
-    int16_t Sim2_y = Sim1_y + d_i2_y;
-    int16_t Sim2_z = Sim1_z + d_i2_z;
+    out[1].tag = rawTag;
+    out[1].x   = x1;
+    out[1].y   = y1;
+    out[1].z   = z1;
 
-    // Chronological order:
-    out[0] = { rawTag, Sim2_x, Sim2_y, Sim2_z };  // (i-2)
-    out[1] = { rawTag, Sim1_x, Sim1_y, Sim1_z };  // (i-1)
+    // Update last_* to newest sample
+    *last_x = x1;
+    *last_y = y1;
+    *last_z = z1;
+    *have_last = true;
 
-    // S(i) is still the newest (unchanged)
     return 2;
   }
 
-  // =====================================================================
-  // 3) 3×C BLOCK
-  // =====================================================================
-  if (tag == 0x09 || tag == 0x0D)  // accel / gyro 3×C
-  {
+  // ------------------------------------------------------------------
+  // 3) 3×C compressed block → 3 samples
+  // ------------------------------------------------------------------
+  if (comp == COMP_3X) {
     if (maxOut < 3) return 0;
 
-    // Parse 5-bit packed diffs
-    uint16_t wX = (data[1] << 8) | data[0];
-    uint16_t wY = (data[3] << 8) | data[2];
-    uint16_t wZ = (data[5] << 8) | data[4];
+    int16_t diff[9];
+    get_diff_3x(diff, data);
 
-    int16_t d_i2_x = signExtend5(wX);
-    int16_t d_i2_y = signExtend5(wX >> 5);
-    int16_t d_i2_z = signExtend5(wX >> 10);
+    // ST logic:
+    // s0 = last + diff[0..2]
+    // s1 = s0  + diff[3..5]
+    // s2 = s1  + diff[6..8]
+    int16_t x0 = *last_x + diff[0];
+    int16_t y0 = *last_y + diff[1];
+    int16_t z0 = *last_z + diff[2];
 
-    int16_t d_i1_x = signExtend5(wY);
-    int16_t d_i1_y = signExtend5(wY >> 5);
-    int16_t d_i1_z = signExtend5(wY >> 10);
+    int16_t x1 = x0 + diff[3];
+    int16_t y1 = y0 + diff[4];
+    int16_t z1 = z0 + diff[5];
 
-    int16_t d_i_x = signExtend5(wZ);
-    int16_t d_i_y = signExtend5(wZ >> 5);
-    int16_t d_i_z = signExtend5(wZ >> 10);
+    int16_t x2 = x1 + diff[6];
+    int16_t y2 = y1 + diff[7];
+    int16_t z2 = z1 + diff[8];
 
-    // Base = S(i+1) = S_last — this is the critical fix!
-    // ST AN5192: 3×C diffs are relative to the sample AFTER the block.
-    int16_t Sip1_x = S_last_x;
-    int16_t Sip1_y = S_last_y;
-    int16_t Sip1_z = S_last_z;
+    out[0].tag = rawTag;
+    out[0].x   = x0;
+    out[0].y   = y0;
+    out[0].z   = z0;
 
-    // Now reconstruct backwards:
-    int16_t Si_x = Sip1_x - d_i_x;
-    int16_t Si_y = Sip1_y - d_i_y;
-    int16_t Si_z = Sip1_z - d_i_z;
+    out[1].tag = rawTag;
+    out[1].x   = x1;
+    out[1].y   = y1;
+    out[1].z   = z1;
 
-    int16_t Sim1_x = Si_x - d_i1_x;
-    int16_t Sim1_y = Si_y - d_i1_y;
-    int16_t Sim1_z = Si_z - d_i1_z;
+    out[2].tag = rawTag;
+    out[2].x   = x2;
+    out[2].y   = y2;
+    out[2].z   = z2;
 
-    int16_t Sim2_x = Sim1_x - d_i2_x;
-    int16_t Sim2_y = Sim1_y - d_i2_y;
-    int16_t Sim2_z = Sim1_z - d_i2_z;
-
-    // Output oldest → newest
-    out[0] = { rawTag, Sim2_x, Sim2_y, Sim2_z };
-    out[1] = { rawTag, Sim1_x, Sim1_y, Sim1_z };
-    out[2] = { rawTag, Si_x, Si_y, Si_z };
-
-    // Update last sample to newest actual sample:
-    S_last_x = Si_x;
-    S_last_y = Si_y;
-    S_last_z = Si_z;
-    have = true;
+    *last_x = x2;
+    *last_y = y2;
+    *last_z = z2;
+    *have_last = true;
 
     return 3;
   }
-
+  
   return 0;
 }
 
 
-size_t readFIFO(fifoSample_t *buffer,  FifoDecompState &decomp, size_t maxSamples) {
+size_t readFIFO(fifoSample_t *buffer, FifoDecompState &decomp, size_t maxSamples) {
   uint8_t diff_lo, status2;
   if (!read8(REG_FIFO_STATUS1, diff_lo) || !read8(REG_FIFO_STATUS2, status2))
     return 0;
@@ -465,4 +470,88 @@ void calibrateIMU(struct Calibration &calib, FifoDecompState &decomp, size_t sam
                 calib.gx_off, calib.gy_off, calib.gz_off);
 
   delay(2000);
+}
+
+void readAccelDirect(int16_t &ax, int16_t &ay, int16_t &az) {
+  uint8_t buf[6];
+  if (!readBytes(REG_OUTX_L_A, buf, 6)) {
+    ax = ay = az = 0;
+    return;
+  }
+  ax = (int16_t)(buf[1] << 8 | buf[0]);
+  ay = (int16_t)(buf[3] << 8 | buf[2]);
+  az = (int16_t)(buf[5] << 8 | buf[4]);
+}
+
+// Map tag (after mask/shift) to sensor type
+static SensorType getSensorTypeFromTag(uint8_t tag)
+{
+  switch (tag) {
+    case TAG_XL:
+    case TAG_XL_UNCOMPRESSED_T_1:
+    case TAG_XL_UNCOMPRESSED_T_2:
+    case TAG_XL_COMPRESSED_2X:
+    case TAG_XL_COMPRESSED_3X:
+      return SENSOR_ACCEL;
+
+    case TAG_GY:
+    case TAG_GY_UNCOMPRESSED_T_1:
+    case TAG_GY_UNCOMPRESSED_T_2:
+    case TAG_GY_COMPRESSED_2X:
+    case TAG_GY_COMPRESSED_3X:
+      return SENSOR_GYRO;
+
+    default:
+      return SENSOR_NONE;
+  }
+}
+
+static CompressionType getCompressionTypeFromTag(uint8_t tag)
+{
+  switch (tag) {
+    case TAG_XL_UNCOMPRESSED_T_2:
+    case TAG_GY_UNCOMPRESSED_T_2:
+      return COMP_NC_T2;
+
+    case TAG_XL_UNCOMPRESSED_T_1:
+    case TAG_GY_UNCOMPRESSED_T_1:
+      return COMP_NC_T1;
+
+    case TAG_XL_COMPRESSED_2X:
+    case TAG_GY_COMPRESSED_2X:
+      return COMP_2X;
+
+    case TAG_XL_COMPRESSED_3X:
+    case TAG_GY_COMPRESSED_3X:
+      return COMP_3X;
+
+    default:
+      return COMP_NC; // TAG_XL, TAG_GY, TEMP, etc.
+  }
+}
+
+static void get_diff_2x(int16_t diff[6], const uint8_t input[6])
+{
+  for (uint8_t i = 0; i < 6u; i++) {
+    diff[i] = (input[i] < 128u) ? (int16_t)input[i]
+                                : (int16_t)input[i] - 256;
+  }
+}
+
+// Exact port of STM's get_diff_3x()
+static void get_diff_3x(int16_t diff[9], const uint8_t input[6])
+{
+  uint16_t decode_tmp;
+
+  for (uint8_t i = 0; i < 3u; i++) {
+
+    decode_tmp = (uint16_t)input[2u * i] |
+                 ((uint16_t)input[2u * i + 1] << 8);
+
+    for (uint8_t j = 0; j < 3u; j++) {
+      uint16_t utmp = (decode_tmp & ((uint16_t)0x1Fu << (5u * j))) >> (5u * j);
+      int16_t tmp = (int16_t)utmp;
+      diff[j + 3u * i] = (tmp < 16) ? tmp : (tmp - 32);
+    }
+  }
 }

@@ -23,11 +23,19 @@ void processSample(const fifoSample_t &s) {
   static struct CombinedSample combined;
   uint8_t tag = s.tag & 0x1F;
 
+  float ax, ay, az; // Acceleration for each dimension
+
   if (isAccelData(tag)) {
-    // apply offset
-    float ax = (s.x - calib.ax_off) * ACC_SENS_16G;  // mg
-    float ay = (s.y - calib.ay_off) * ACC_SENS_16G;
-    float az = (s.z - calib.az_off) * ACC_SENS_16G;
+    // Conditionally apply offset
+    // If the value is below the noise threshold, then it must be zero.
+    // ax = (abs(s.x) < calib.ax_off)? 0 : (s.x - calib.ax_off) * ACC_SENS_16G;
+    // ay = (abs(s.y) < calib.ay_off)? 0 : (s.y - calib.ay_off) * ACC_SENS_16G;
+    // az = (abs(s.z) < calib.az_off)? 0 : (s.z - calib.az_off) * ACC_SENS_16G;
+
+    // Original scaling
+    ax = (s.x - calib.ax_off) * ACC_SENS_16G;  // mg
+    ay = (s.y - calib.ay_off) * ACC_SENS_16G;
+    az = (s.z - calib.az_off) * ACC_SENS_16G;
 
     combined.ax = ax;
     combined.ay = ay;
@@ -57,8 +65,7 @@ void processSample(const fifoSample_t &s) {
                   combined.ax, combined.ay, combined.az,
                   combined.gx, combined.gy, combined.gz);
 
-    combined.hasAccel = false;
-    combined.hasGyro = false;
+    memset(&combined, 0, sizeof(combined));
   }
 }
 
@@ -120,6 +127,17 @@ void loop() {
     Serial.println("t ax ay az gx gy gz");
     headerPrinted = true;
   }
+
+
+  int16_t axr, ayr, azr;
+  readAccelDirect(axr, ayr, azr);
+
+  float ax_mg = axr * ACC_SENS_16G;
+  float ay_mg = ayr * ACC_SENS_16G;
+  float az_mg = azr * ACC_SENS_16G;
+
+  Serial.printf("[DIRECT] raw: %6d %6d %6d  mg: %7.2f %7.2f %7.2f\n",
+                axr, ayr, azr, ax_mg, ay_mg, az_mg);
 
   size_t n = readFIFO(fifoBuf, decomp, fifo_capacity);
   if (n > 0) {
