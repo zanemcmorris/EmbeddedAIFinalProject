@@ -49,7 +49,6 @@ bool startIMU(uint16_t sensorFreq) {
   write8(REG_FIFO_CTRL4, 0x06);                      // FIFO_CTRL4: 1 = FIFO (stop-when-full), 0x6 = continous & overwrite old data
 
   dumpIMURegisters_Fixed();
-  delay(3000);
   calibrateIMU(300);
 
   return status;
@@ -83,11 +82,11 @@ bool isAccelData(uint8_t rawTag) {
   }
 }
 
-bool isGyroData(fifoSample_t* sample){
+bool isGyroData(fifoSample_t *sample) {
   return isGyroData(sample->tag);
 }
 
-bool isAccelData(fifoSample_t* sample){
+bool isAccelData(fifoSample_t *sample) {
   return isAccelData(sample->tag);
 }
 
@@ -241,7 +240,7 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
   // Select the "last" sample state for this sensor
   int16_t *last_x, *last_y, *last_z;
   bool *have_last;
-  uint8_t *data = (uint8_t*) &sampleIn->x;
+  uint8_t *data = (uint8_t *)&sampleIn->x;
 
   static_assert(sizeof(FifoDecompState::ax_last) == sizeof(int16_t), "field types");
 
@@ -379,8 +378,7 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
   return 0;
 }
 
-uint16_t getFIFOSize()
-{
+uint16_t getFIFOSize() {
   uint8_t diff_lo, status2;
   if (!read8(REG_FIFO_STATUS1, diff_lo) || !read8(REG_FIFO_STATUS2, status2))
     return 0;
@@ -423,7 +421,7 @@ size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
     //                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
     // }
 
-    size_t nDecoded = decodeFifoWord((fifoSample_t*) raw,
+    size_t nDecoded = decodeFifoWord((fifoSample_t *)raw,
                                      &buffer[outCount],
                                      maxSamples - outCount);
     outCount += nDecoded;
@@ -461,7 +459,7 @@ size_t readFIFONoDecode(fifoSample_t *buffer, size_t maxSamples) {
     uint8_t raw[7];
     if (!readBytes(REG_FIFO_DATA_OUT_TAG, raw, 7)) break;
 
-    fifoSample_t* outputSample_p = (buffer + outCount);
+    fifoSample_t *outputSample_p = (buffer + outCount);
     outputSample_p->tag = raw[0];
     outputSample_p->x = (int16_t)(raw[1] << 8 | raw[0]);
     outputSample_p->y = (int16_t)(raw[2] << 8 | raw[3]);
@@ -543,6 +541,7 @@ void calibrateIMU(size_t samples) {
 
   // reset decompressor state so old history doesn't pollute calibration
   memset(&decomp, 0, sizeof(decomp));
+  memset(&calib, 0, sizeof(calib));
   fifoSample_t flushBuf[32];
   while (readFIFO(flushBuf, 32) > 0) {
     delay(5);
@@ -556,16 +555,15 @@ void calibrateIMU(size_t samples) {
     }
 
     for (size_t i = 0; i < n; i++) {
-      uint8_t tag = buf[i].tag & 0x1F;
 
-      if (isAccelData(tag)) {
+      if (isAccelData(buf[i].tag)) {
         ax_sum += buf[i].x;
         ay_sum += buf[i].y;
         az_sum += buf[i].z;
         accelCount++;
       }
 
-      if (isGyroData(tag)) {
+      if (isGyroData(buf[i].tag)) {
         gx_sum += buf[i].x;
         gy_sum += buf[i].y;
         gz_sum += buf[i].z;
@@ -605,7 +603,7 @@ void calibrateIMU(size_t samples) {
   Serial.printf("Gyro offsets  (LSB): %.2f %.2f %.2f\n",
                 calib.gx_off, calib.gy_off, calib.gz_off);
 
-  delay(2000);
+  delay(200);
   isCalibrated = true;
 }
 
@@ -715,11 +713,8 @@ static void get_diff_3x(int16_t diff[9], const uint8_t input[6]) {
  * 
  * @return: None
  */
-void processSample(const fifoSample_t &sample, float* dataOut) {
-  uint8_t tag = (sample.tag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
-
-
-  if (isAccelData(tag)) {
+void processSample(const fifoSample_t &sample, float *dataOut) {
+  if (isAccelData(sample.tag)) {
     // Conditionally apply offset
     // If the value is below the noise threshold, then it must be zero.
     // ax = (abs(s.x) < calib.ax_off)? 0 : (s.x - calib.ax_off) * ACC_SENS_16G;
@@ -730,10 +725,9 @@ void processSample(const fifoSample_t &sample, float* dataOut) {
     dataOut[0] = (sample.x - calib.ax_off) * ACC_SENS_16G;  // mg
     dataOut[1] = (sample.y - calib.ay_off) * ACC_SENS_16G;
     dataOut[2] = (sample.z - calib.az_off) * ACC_SENS_16G;
-
   }
 
-  if (isGyroData(tag)) {
+  if (isGyroData(sample.tag)) {
     dataOut[0] = (sample.x - calib.gx_off) * GYRO_SENS_500DPS / 1000.0f;  // dps
     dataOut[1] = (sample.y - calib.gy_off) * GYRO_SENS_500DPS / 1000.0f;
     dataOut[2] = (sample.z - calib.gz_off) * GYRO_SENS_500DPS / 1000.0f;
