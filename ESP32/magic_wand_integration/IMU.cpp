@@ -225,22 +225,19 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
                       size_t maxOut) {
   if (maxOut == 0) return 0;
 
-  // Extract sensor/compression tag from upper 5 bits
-  uint8_t tag = (sampleIn->tag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
+  // Extract sensor/compression tag from upper bits
+  uint8_t tagField = (sampleIn->tag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
 
-  // Figure out sensor and compression type
-  SensorType sensor = getSensorTypeFromTag(tag);
-  CompressionType comp = getCompressionTypeFromTag(tag);
+  SensorType sensor = getSensorTypeFromTag(tagField);
+  CompressionType comp = getCompressionTypeFromTag(tagField);
 
   if (sensor == SENSOR_NONE) {
-    // Temperature, timestamps, ODR change, etc. → ignore for now
     return 0;
   }
 
-  // Select the "last" sample state for this sensor
   int16_t *last_x, *last_y, *last_z;
   bool *have_last;
-  uint8_t *data = (uint8_t *)&sampleIn->x;
+  uint8_t *data = sampleIn->payload;  // <-- RAW FIFO BYTES HERE
 
   static_assert(sizeof(FifoDecompState::ax_last) == sizeof(int16_t), "field types");
 
@@ -249,19 +246,15 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     last_y = &decomp.ay_last;
     last_z = &decomp.az_last;
     have_last = &decomp.have_accel;
-  } else {  // SENSOR_GYRO
+  } else {
     last_x = &decomp.gx_last;
     last_y = &decomp.gy_last;
     last_z = &decomp.gz_last;
     have_last = &decomp.have_gyro;
   }
 
-  // ------------------------------------------------------------------
-  // 1) Uncompressed cases: NC, NC_T1, NC_T2
-  // (For your purposes we treat them the same: just a plain sample.)
-  // ------------------------------------------------------------------
+  // --- Uncompressed NC/NC_T1/NC_T2 ---
   if (comp == COMP_NC || comp == COMP_NC_T1 || comp == COMP_NC_T2) {
-
     if (maxOut < 1) return 0;
 
     int16_t x = (int16_t)((data[1] << 8) | data[0]);
@@ -273,7 +266,7 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     *last_z = z;
     *have_last = true;
 
-    out[0].tag = sampleIn->tag;
+    out[0].tag = sampleIn->tag;  // keep original tag byte
     out[0].x = x;
     out[0].y = y;
     out[0].z = z;
@@ -281,24 +274,18 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     return 1;
   }
 
-  // We shouldn't ever see compressed data before having a base sample
+  // No base sample yet for compressed data
   if (!*have_last) {
-    // No base yet: we can't decompress this block safely
     return 0;
   }
 
-  // ------------------------------------------------------------------
-  // 2) 2×C compressed block → 2 samples
-  // ------------------------------------------------------------------
+  // --- 2× compressed ---
   if (comp == COMP_2X) {
     if (maxOut < 2) return 0;
 
     int16_t diff[6];
     get_diff_2x(diff, data);
 
-    // ST logic:
-    // sample0 = last + diff[0..2]
-    // sample1 = sample0 + diff[3..5]
     int16_t x0 = *last_x + diff[0];
     int16_t y0 = *last_y + diff[1];
     int16_t z0 = *last_z + diff[2];
@@ -307,7 +294,6 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     int16_t y1 = y0 + diff[4];
     int16_t z1 = z0 + diff[5];
 
-    // Oldest → newest
     out[0].tag = sampleIn->tag;
     out[0].x = x0;
     out[0].y = y0;
@@ -318,7 +304,6 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     out[1].y = y1;
     out[1].z = z1;
 
-    // Update last_* to newest sample
     *last_x = x1;
     *last_y = y1;
     *last_z = z1;
@@ -327,19 +312,13 @@ size_t decodeFifoWord(fifoSample_t *sampleIn,
     return 2;
   }
 
-  // ------------------------------------------------------------------
-  // 3) 3×C compressed block → 3 samples
-  // ------------------------------------------------------------------
+  // --- 3× compressed ---
   if (comp == COMP_3X) {
     if (maxOut < 3) return 0;
 
     int16_t diff[9];
     get_diff_3x(diff, data);
 
-    // ST logic:
-    // s0 = last + diff[0..2]
-    // s1 = s0  + diff[3..5]
-    // s2 = s1  + diff[6..8]
     int16_t x0 = *last_x + diff[0];
     int16_t y0 = *last_y + diff[1];
     int16_t z0 = *last_z + diff[2];
@@ -405,9 +384,6 @@ size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
   if (fifo_level == 0)
     return 0;
 
-  // fifo_level = number of FIFO "words" (tag+6B), not decoded samples
-  // Serial.printf("Fifo words: %d\n", fifo_level);
-
   size_t outCount = 0;
 
   for (uint16_t i = 0; i < fifo_level; i++) {
@@ -416,12 +392,11 @@ size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
     uint8_t raw[7];
     if (!readBytes(REG_FIFO_DATA_OUT_TAG, raw, 7)) break;
 
-    // if (isAccelData(raw[0])) {
-    //   Serial.printf("TAG %02X RAW: %02X %02X %02X %02X %02X %02X\n",
-    //                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
-    // }
+    fifoSample_t tmp;
+    tmp.tag = raw[0];
+    memcpy(tmp.payload, &raw[1], 6);
 
-    size_t nDecoded = decodeFifoWord((fifoSample_t *)raw,
+    size_t nDecoded = decodeFifoWord(&tmp,
                                      &buffer[outCount],
                                      maxSamples - outCount);
     outCount += nDecoded;
@@ -448,9 +423,6 @@ size_t readFIFONoDecode(fifoSample_t *buffer, size_t maxSamples) {
   if (fifo_level == 0)
     return 0;
 
-  // fifo_level = number of FIFO "words" (tag+6B), not decoded samples
-  // Serial.printf("Fifo words: %d\n", fifo_level);
-
   size_t outCount = 0;
 
   for (uint16_t i = 0; i < fifo_level; i++) {
@@ -459,17 +431,17 @@ size_t readFIFONoDecode(fifoSample_t *buffer, size_t maxSamples) {
     uint8_t raw[7];
     if (!readBytes(REG_FIFO_DATA_OUT_TAG, raw, 7)) break;
 
-    fifoSample_t *outputSample_p = (buffer + outCount);
+    fifoSample_t *outputSample_p = &buffer[outCount];
     outputSample_p->tag = raw[0];
-    outputSample_p->x = (int16_t)(raw[1] << 8 | raw[0]);
-    outputSample_p->y = (int16_t)(raw[2] << 8 | raw[3]);
-    outputSample_p->z = (int16_t)(raw[4] << 8 | raw[5]);
+    memcpy(outputSample_p->payload, &raw[1], 6);
+    // Leave x/y/z untouched here; they'll be filled by decodeFifoWord for compressed flows
 
     outCount += 1;
   }
 
   return outCount;
 }
+
 
 /**
  * @brief enable both Accelerometer and Gyroscope peripherals in the IMU at the same sampling freq.

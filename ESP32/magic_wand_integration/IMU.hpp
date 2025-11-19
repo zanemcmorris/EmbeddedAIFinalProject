@@ -42,6 +42,7 @@ enum CompressionType {
 
 typedef struct FifoSample {
   uint8_t tag;  // FIFO tag byte
+  uint8_t payload[6];
   int16_t x;
   int16_t y;
   int16_t z;
