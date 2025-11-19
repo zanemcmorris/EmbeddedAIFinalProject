@@ -83,6 +83,14 @@ bool isAccelData(uint8_t rawTag) {
   }
 }
 
+bool isGyroData(fifoSample_t* sample){
+  return isGyroData(sample->tag);
+}
+
+bool isAccelData(fifoSample_t* sample){
+  return isAccelData(sample->tag);
+}
+
 
 size_t dumpFirstNTags(uint16_t n, uint32_t timeout_ms) {
   // Poll DIFF_FIFO_[9:0] until we have at least n words, or timeout
@@ -209,15 +217,17 @@ static int16_t signExtend5(int v) {
   return (int16_t)v;
 }
 
-size_t decodeFifoWord(uint8_t rawTag,
-                      const uint8_t data[6],
+
+/**
+ * @brief Decode sample
+ */
+size_t decodeFifoWord(fifoSample_t *sampleIn,
                       fifoSample_t *out,
-                      size_t maxOut,
-                      FifoDecompState &decomp) {
+                      size_t maxOut) {
   if (maxOut == 0) return 0;
 
   // Extract sensor/compression tag from upper 5 bits
-  uint8_t tag = (rawTag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
+  uint8_t tag = (sampleIn->tag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
 
   // Figure out sensor and compression type
   SensorType sensor = getSensorTypeFromTag(tag);
@@ -231,6 +241,7 @@ size_t decodeFifoWord(uint8_t rawTag,
   // Select the "last" sample state for this sensor
   int16_t *last_x, *last_y, *last_z;
   bool *have_last;
+  uint8_t *data = (uint8_t*) &sampleIn->x;
 
   static_assert(sizeof(FifoDecompState::ax_last) == sizeof(int16_t), "field types");
 
@@ -263,7 +274,7 @@ size_t decodeFifoWord(uint8_t rawTag,
     *last_z = z;
     *have_last = true;
 
-    out[0].tag = rawTag;
+    out[0].tag = sampleIn->tag;
     out[0].x = x;
     out[0].y = y;
     out[0].z = z;
@@ -298,12 +309,12 @@ size_t decodeFifoWord(uint8_t rawTag,
     int16_t z1 = z0 + diff[5];
 
     // Oldest → newest
-    out[0].tag = rawTag;
+    out[0].tag = sampleIn->tag;
     out[0].x = x0;
     out[0].y = y0;
     out[0].z = z0;
 
-    out[1].tag = rawTag;
+    out[1].tag = sampleIn->tag;
     out[1].x = x1;
     out[1].y = y1;
     out[1].z = z1;
@@ -342,17 +353,17 @@ size_t decodeFifoWord(uint8_t rawTag,
     int16_t y2 = y1 + diff[7];
     int16_t z2 = z1 + diff[8];
 
-    out[0].tag = rawTag;
+    out[0].tag = sampleIn->tag;
     out[0].x = x0;
     out[0].y = y0;
     out[0].z = z0;
 
-    out[1].tag = rawTag;
+    out[1].tag = sampleIn->tag;
     out[1].x = x1;
     out[1].y = y1;
     out[1].z = z1;
 
-    out[2].tag = rawTag;
+    out[2].tag = sampleIn->tag;
     out[2].x = x2;
     out[2].y = y2;
     out[2].z = z2;
@@ -368,7 +379,25 @@ size_t decodeFifoWord(uint8_t rawTag,
   return 0;
 }
 
+uint16_t getFIFOSize()
+{
+  uint8_t diff_lo, status2;
+  if (!read8(REG_FIFO_STATUS1, diff_lo) || !read8(REG_FIFO_STATUS2, status2))
+    return 0;
 
+  uint16_t fifo_level = ((status2 & 0x03) << 8) | diff_lo;
+  return fifo_level;
+}
+
+/**
+ * @brief read maxSamples fifo samples from the IMU into the buffer provided by user, decoding each raw word.
+ * 
+ * @param[in] buffer: pointer to buffer that fifo samples get read into.
+ * @param[in] maxSamples: The max number of samples to read into buffer without overflowing.
+ *                        Note: Due to the compressed nature of the data, it is probable that more than one fifo word
+ *                        will be decoded from the raw fifo sample, up to three values.
+ * @return number of fifo samples written to output buffer. 0 Indicates a failure or empty buffer
+ */
 size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
   uint8_t diff_lo, status2;
   if (!read8(REG_FIFO_STATUS1, diff_lo) || !read8(REG_FIFO_STATUS2, status2))
@@ -379,7 +408,7 @@ size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
     return 0;
 
   // fifo_level = number of FIFO "words" (tag+6B), not decoded samples
-  Serial.printf("Fifo words: %d\n", fifo_level);
+  // Serial.printf("Fifo words: %d\n", fifo_level);
 
   size_t outCount = 0;
 
@@ -394,15 +423,63 @@ size_t readFIFO(fifoSample_t *buffer, size_t maxSamples) {
     //                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
     // }
 
-    size_t nDecoded = decodeFifoWord(raw[0], &raw[1],
+    size_t nDecoded = decodeFifoWord((fifoSample_t*) raw,
                                      &buffer[outCount],
-                                     maxSamples - outCount, decomp);
+                                     maxSamples - outCount);
     outCount += nDecoded;
   }
 
   return outCount;
 }
 
+/**
+ * @brief read raw maxSamples fifo samples from the IMU into the buffer provided by user.
+ * 
+ * @param[in] buffer: pointer to buffer that fifo samples get read into.
+ * @param[in] maxSamples: The max number of samples to read into buffer without overflowing.
+ *                        Note: This function does NOT decode compressed data, so reads will be 1:1 for fifosamples
+ * 
+ * @return number of fifo samples written to output buffer. 0 Indicates a failure or empty buffer
+ */
+size_t readFIFONoDecode(fifoSample_t *buffer, size_t maxSamples) {
+  uint8_t diff_lo, status2;
+  if (!read8(REG_FIFO_STATUS1, diff_lo) || !read8(REG_FIFO_STATUS2, status2))
+    return 0;
+
+  uint16_t fifo_level = ((status2 & 0x03) << 8) | diff_lo;
+  if (fifo_level == 0)
+    return 0;
+
+  // fifo_level = number of FIFO "words" (tag+6B), not decoded samples
+  // Serial.printf("Fifo words: %d\n", fifo_level);
+
+  size_t outCount = 0;
+
+  for (uint16_t i = 0; i < fifo_level; i++) {
+    if (outCount >= maxSamples) break;
+
+    uint8_t raw[7];
+    if (!readBytes(REG_FIFO_DATA_OUT_TAG, raw, 7)) break;
+
+    fifoSample_t* outputSample_p = (buffer + outCount);
+    outputSample_p->tag = raw[0];
+    outputSample_p->x = (int16_t)(raw[1] << 8 | raw[0]);
+    outputSample_p->y = (int16_t)(raw[2] << 8 | raw[3]);
+    outputSample_p->z = (int16_t)(raw[4] << 8 | raw[5]);
+
+    outCount += 1;
+  }
+
+  return outCount;
+}
+
+/**
+ * @brief enable both Accelerometer and Gyroscope peripherals in the IMU at the same sampling freq.
+ * 
+ * @param[in] uint16_t frequencyHz: Desired sensor frequency.
+ * 
+ * @return bool status: True if the I2C writes were completes successfully; false otherwise.
+ */
 bool enableAccelGyro(uint16_t frequencyHz) {
   uint8_t odrBits = 0;
 
@@ -429,6 +506,11 @@ bool enableAccelGyro(uint16_t frequencyHz) {
   return true;
 }
 
+/**
+ * @brief Reset the IMU and clear the FIFO buffer by placing the FIFO into bypass mode.
+ * 
+ * @return None
+ */
 void resetAndBypass() {
   // SW reset (CTRL3_C.SW_RESET=1) then re-enable BDU + IF_INC
   write8(REG_CTRL3_C, 0x01);  // SW_RESET
@@ -441,6 +523,11 @@ void resetAndBypass() {
   write8(REG_FIFO_CTRL2, 0x00);
 }
 
+/**
+ * @brief Calibration routine for the IMU at rest. Averages samples over a brief period to compute noise floor
+ * 
+ * @return None
+ */
 void calibrateIMU(size_t samples) {
   Serial.println("Calibrating... keep device completely still!");
   delay(1000);
@@ -522,6 +609,9 @@ void calibrateIMU(size_t samples) {
   isCalibrated = true;
 }
 
+/**
+ * @brief Read accelerometer registers directly, bypassing FIFO. Usefull for sanity checking FIFO values
+ */
 void readAccelDirect(int16_t &ax, int16_t &ay, int16_t &az) {
   uint8_t buf[6];
   if (!readBytes(REG_OUTX_L_A, buf, 6)) {
@@ -533,8 +623,14 @@ void readAccelDirect(int16_t &ax, int16_t &ay, int16_t &az) {
   az = (int16_t)(buf[5] << 8 | buf[4]);
 }
 
-// Map tag (after mask/shift) to sensor type
+
+/**
+ * @brief From raw tag return what type of information this fifosample is
+ * 
+ * @return enum SensorType: The type of sensor that produced the data.
+ */
 static SensorType getSensorTypeFromTag(uint8_t tag) {
+  // TODO: Add tag decoding here?
   switch (tag) {
     case TAG_XL:
     case TAG_XL_UNCOMPRESSED_T_1:
@@ -555,6 +651,11 @@ static SensorType getSensorTypeFromTag(uint8_t tag) {
   }
 }
 
+/**
+ * @brief Returns the type of compression present in the fifo sample based on the tag
+ * 
+ * @return enum CompressionType
+ */
 static CompressionType getCompressionTypeFromTag(uint8_t tag) {
   switch (tag) {
     case TAG_XL_UNCOMPRESSED_T_2:
@@ -578,6 +679,9 @@ static CompressionType getCompressionTypeFromTag(uint8_t tag) {
   }
 }
 
+/**
+ * @brief Helper function for decoding compressed FIFO samples. Taken from STM sample code
+ */
 static void get_diff_2x(int16_t diff[6], const uint8_t input[6]) {
   for (uint8_t i = 0; i < 6u; i++) {
     diff[i] = (input[i] < 128u) ? (int16_t)input[i]
@@ -585,7 +689,9 @@ static void get_diff_2x(int16_t diff[6], const uint8_t input[6]) {
   }
 }
 
-// Exact port of STM's get_diff_3x()
+/**
+ * @brief Helper function for decoding compressed FIFO samples. Taken from STM sample code
+ */
 static void get_diff_3x(int16_t diff[9], const uint8_t input[6]) {
   uint16_t decode_tmp;
 
@@ -601,11 +707,17 @@ static void get_diff_3x(int16_t diff[9], const uint8_t input[6]) {
   }
 }
 
-void processSample(const fifoSample_t &s) {
-  static struct CombinedSample combined;
-  uint8_t tag = s.tag & 0x1F;
+/**
+ * @brief apply calibration factor and other optional filtering on fifo sample and write in-place to dataOut array
+ * 
+ * @param[in] sample: Pass-by-reference fifoSample to be processed. Must be fully decompressed.
+ * @param[in] dataout: Pointer to float array to hold output data. Overflow safety must be managed by user
+ * 
+ * @return: None
+ */
+void processSample(const fifoSample_t &sample, float* dataOut) {
+  uint8_t tag = (sample.tag & TAG_SENSOR_MASK) >> TAG_SENSOR_SHIFT;
 
-  float ax, ay, az; // Acceleration for each dimension
 
   if (isAccelData(tag)) {
     // Conditionally apply offset
@@ -615,38 +727,15 @@ void processSample(const fifoSample_t &s) {
     // az = (abs(s.z) < calib.az_off)? 0 : (s.z - calib.az_off) * ACC_SENS_16G;
 
     // Original scaling
-    ax = (s.x - calib.ax_off) * ACC_SENS_16G;  // mg
-    ay = (s.y - calib.ay_off) * ACC_SENS_16G;
-    az = (s.z - calib.az_off) * ACC_SENS_16G;
+    dataOut[0] = (sample.x - calib.ax_off) * ACC_SENS_16G;  // mg
+    dataOut[1] = (sample.y - calib.ay_off) * ACC_SENS_16G;
+    dataOut[2] = (sample.z - calib.az_off) * ACC_SENS_16G;
 
-    combined.ax = ax;
-    combined.ay = ay;
-    combined.az = az;
-
-    combined.hasAccel = true;
   }
 
   if (isGyroData(tag)) {
-    float gx = (s.x - calib.gx_off) * GYRO_SENS_500DPS / 1000.0f;  // dps
-    float gy = (s.y - calib.gy_off) * GYRO_SENS_500DPS / 1000.0f;
-    float gz = (s.z - calib.gz_off) * GYRO_SENS_500DPS / 1000.0f;
-
-    combined.gx = gx;
-    combined.gy = gy;
-    combined.gz = gz;
-
-    combined.hasGyro = true;
-  }
-
-  // print combined only when both present
-  if (combined.hasAccel && combined.hasGyro) {
-    static uint32_t t0 = millis();
-    uint32_t t = millis() - t0;
-
-    Serial.printf("%.3f %.3f %.3f %.3f %.3f %.3f\n",
-                  combined.ax, combined.ay, combined.az,
-                  combined.gx, combined.gy, combined.gz);
-
-    memset(&combined, 0, sizeof(combined));
+    dataOut[0] = (sample.x - calib.gx_off) * GYRO_SENS_500DPS / 1000.0f;  // dps
+    dataOut[1] = (sample.y - calib.gy_off) * GYRO_SENS_500DPS / 1000.0f;
+    dataOut[2] = (sample.z - calib.gz_off) * GYRO_SENS_500DPS / 1000.0f;
   }
 }

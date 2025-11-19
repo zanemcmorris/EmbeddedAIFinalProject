@@ -78,6 +78,9 @@ bool startIMU(uint16_t sensorFreq);
 bool isGyroData(uint8_t rawTag);
 bool isAccelData(uint8_t rawTag);
 
+bool isGyroData(fifoSample_t* sample);
+bool isAccelData(fifoSample_t* sample);
+
 size_t dumpFirstNTags(uint16_t n, uint32_t timeout_ms = 1000);
 bool readUI(uint8_t reg, uint8_t &val);
 bool readEmbedded(uint8_t reg, uint8_t &val);
@@ -89,15 +92,15 @@ void dumpIMURegisters_Fixed();
 bool setFuncCfg(bool enable);
 void disableFifoCompression();
 static int16_t signExtend5(int v);
-size_t decodeFifoWord(uint8_t rawTag,
-                      const uint8_t data[6],
-                      fifoSample_t *out,
-                      size_t maxOut);
+size_t decodeFifoWord(fifoSample_t* sampleIn, fifoSample_t *out, size_t maxOut);
+uint16_t getFIFOSize();
+
 size_t readFIFO(fifoSample_t *buffer, size_t maxSamples = 300);
+size_t readFIFONoDecode(fifoSample_t *buffer, size_t maxSamples = 300);
 bool enableAccelGyro(uint16_t frequencyHz);
 void resetAndBypass();
 void calibrateIMU(size_t samples = 300);
-void processSample(const fifoSample_t &s);
+void processSample(const fifoSample_t &s, float* dataOut);
 
 void readAccelDirect(int16_t &ax, int16_t &ay, int16_t &az);
 
