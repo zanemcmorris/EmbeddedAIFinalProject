@@ -14,14 +14,25 @@ limitations under the License.
 #define TENSORFLOW_LITE_MICRO_EXAMPLES_MAGIC_WAND_RASTERIZE_STROKE_H
 
 #include <cstdint>
+#include <cstring>
 
 void RasterizeStroke(
-    int8_t* stroke_points,
-    int stroke_points_count,
-    float x_range, 
-    float y_range, 
-    int width, 
-    int height,
-    int8_t* out_buffer);
+  int8_t* stroke_points,
+  int stroke_points_count,
+  float x_range,
+  float y_range,
+  int width,
+  int height,
+  int8_t* out_buffer);
 
-#endif   // TENSORFLOW_LITE_MICRO_EXAMPLES_MAGIC_WAND_RASTERIZE_STROKE_H
+void RasterizeStrokeColored(
+  const int8_t* stroke_points,
+  const float* stroke_intensity,
+  int32_t point_count,
+  float x_scale,
+  float y_scale,
+  int width,
+  int height,
+  int8_t* out);
+
+#endif  // TENSORFLOW_LITE_MICRO_EXAMPLES_MAGIC_WAND_RASTERIZE_STROKE_H

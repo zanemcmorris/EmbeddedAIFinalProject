@@ -60,13 +60,13 @@ int32_t Abs(int32_t a) {
 }  // namespace
 
 void RasterizeStroke(
-    int8_t* stroke_points,
-    int stroke_points_count,
-    float x_range, 
-    float y_range, 
-    int width, 
-    int height,
-    int8_t* out_buffer) {
+  int8_t* stroke_points,
+  int stroke_points_count,
+  float x_range,
+  float y_range,
+  int width,
+  int height,
+  int8_t* out_buffer) {
   constexpr int num_channels = 3;
   const int buffer_byte_count = height * width * num_channels;
 
@@ -157,5 +157,50 @@ void RasterizeStroke(
       out_buffer[buffer_index + 1] = green_i8;
       out_buffer[buffer_index + 2] = blue_i8;
     }
+  }
+}
+
+void RasterizeStrokeColored(const int8_t* stroke_points,
+                            const float* stroke_intensity,
+                            int32_t point_count,
+                            float x_scale,
+                            float y_scale,
+                            int width,
+                            int height,
+                            int8_t* out) {
+  // Clear buffer to “off” (all black = -128)
+  const int pixel_count = width * height;
+  memset(out, -128, pixel_count * 3 * sizeof(int8_t));  // RGB all -128
+
+  for (int i = 0; i < point_count; ++i) {
+    const int idx = i * 2;
+    const int8_t sx = stroke_points[idx + 0];
+    const int8_t sy = stroke_points[idx + 1];
+
+    // Map from [-128,127] into [0,width/height)
+    float fx = (float)sx / 128.0f;
+    float fy = (float)sy / 128.0f;
+
+    int x = (int)((fx * 0.5f + 0.5f) * (width - 1));
+    int y = (int)((fy * 0.5f + 0.5f) * (height - 1));
+
+    if (x < 0) x = 0;
+    if (x >= width) x = width - 1;
+    if (y < 0) y = 0;
+    if (y >= height) y = height - 1;
+
+    // 0 (low accel) → white; 1 (high accel) → red
+    float a = stroke_intensity ? stroke_intensity[i] : 0.0f;
+    if (a < 0.0f) a = 0.0f;
+    if (a > 1.0f) a = 1.0f;
+
+    const int8_t r = 127;                            // full red
+    const int8_t g = (int8_t)(127.0f * (1.0f - a));  // fades from 127→0
+    const int8_t b = g;                              // keep white-ish
+
+    int pixel_index = (y * width + x) * 3;
+    out[pixel_index + 0] = r;
+    out[pixel_index + 1] = g;
+    out[pixel_index + 2] = b;
   }
 }

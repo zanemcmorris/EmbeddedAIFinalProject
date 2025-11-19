@@ -51,6 +51,8 @@ constexpr int raster_height = 32;
 constexpr int raster_channels = 3;
 constexpr int raster_byte_count = raster_height * raster_width * raster_channels;
 int8_t raster_buffer[raster_byte_count];
+float stroke_accel_norm[stroke_transmit_max_length] = {};
+
 
 BLEService service(BLE_SENSE_UUID("0000"));
 BLECharacteristic strokeCharacteristic(BLE_SENSE_UUID("300a"), BLERead, stroke_struct_byte_count);
@@ -118,9 +120,9 @@ int ReadAccelerometerAndGyroscope(int maxSamples, int* new_accelerometer_samples
 
     readFIFONoDecode(&rawFifoSample, 1);
     if (isGyroData(&rawFifoSample)) {
-        // Serial.printf("TAG %02X RAW: %02X %02X %02X\n",
-        //               rawFifoSample.tag, rawFifoSample.x, rawFifoSample.y, rawFifoSample.z);
-      
+      // Serial.printf("TAG %02X RAW: %02X %02X %02X\n",
+      //               rawFifoSample.tag, rawFifoSample.x, rawFifoSample.y, rawFifoSample.z);
+
 
       numFifoSamples = decodeFifoWord(&rawFifoSample, fifoSamples, 3);
       // Serial.printf("Got %d gyro samples from decoding FIFO word\n", numFifoSamples);
@@ -163,15 +165,15 @@ int ReadAccelerometerAndGyroscope(int maxSamples, int* new_accelerometer_samples
   //                 acceleration_data[(acceleration_data_index - 1 + acceleration_data_length) % acceleration_data_length]);
   // }
 
-  if(*new_gyroscope_samples > 0 && *new_accelerometer_samples > 0){
-    Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f \n",
-                  acceleration_data[(acceleration_data_index - 3 + acceleration_data_length) % acceleration_data_length],
-                  acceleration_data[(acceleration_data_index - 2 + acceleration_data_length) % acceleration_data_length],
-                  acceleration_data[(acceleration_data_index - 1 + acceleration_data_length) % acceleration_data_length],
-                  gyroscope_data[(gyroscope_data_index - 3 + gyroscope_data_length) % gyroscope_data_length],
-                  gyroscope_data[(gyroscope_data_index - 2 + gyroscope_data_length) % gyroscope_data_length],
-                  gyroscope_data[(gyroscope_data_index - 1 + gyroscope_data_length) % gyroscope_data_length]);
-  }
+  // if (*new_gyroscope_samples > 0 && *new_accelerometer_samples > 0) {
+  //   Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f \n",
+  //                 acceleration_data[(acceleration_data_index - 3 + acceleration_data_length) % acceleration_data_length],
+  //                 acceleration_data[(acceleration_data_index - 2 + acceleration_data_length) % acceleration_data_length],
+  //                 acceleration_data[(acceleration_data_index - 1 + acceleration_data_length) % acceleration_data_length],
+  //                 gyroscope_data[(gyroscope_data_index - 3 + gyroscope_data_length) % gyroscope_data_length],
+  //                 gyroscope_data[(gyroscope_data_index - 2 + gyroscope_data_length) % gyroscope_data_length],
+  //                 gyroscope_data[(gyroscope_data_index - 1 + gyroscope_data_length) % gyroscope_data_length]);
+  // }
 
 
   return 1;
@@ -437,6 +439,9 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
 
     *stroke_transmit_length = stroke_length / stroke_transmit_stride;
 
+    constexpr float accel_low = 0.0f;
+    constexpr float accel_high = 16000.0f;  // Accel is configured at 16g full scale
+
     float x_min;
     float y_min;
     float x_max;
@@ -494,6 +499,25 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
       if (is_first || (y_axis > y_max)) {
         y_max = y_axis;
       }
+
+      const int accel_start_index = ((acceleration_data_index + (acceleration_data_length - (3 * (stroke_length + current_head))))
+                                     % acceleration_data_length);
+
+      const int accel_index = (accel_start_index + ((j * stroke_transmit_stride) * 3)) % acceleration_data_length;
+
+      const float* accel_entry = &acceleration_data[accel_index];
+      const float ax = accel_entry[0];  // mg
+      const float ay = accel_entry[1];
+      const float az = accel_entry[2];
+
+      float mag = sqrtf(ax * ax + ay * ay + az * az);  // mg
+
+      // Normalize 0..1 between accel_low and accel_high
+      float norm = (mag - accel_low) / (accel_high - accel_low);
+      if (norm < 0.0f) norm = 0.0f;
+      if (norm > 1.0f) norm = 1.0f;
+
+      stroke_accel_norm[j] = norm;  // one intensity per stroke point
     }
 
     // If the stroke is too small, cancel it.
@@ -656,10 +680,12 @@ void loop() {
 
   // Serial.println("here!");
   if (done_just_triggered) {
-    // TODO: What is done_just_triggered
-
-    //
-    RasterizeStroke(stroke_points, *stroke_transmit_length, 0.6f, 0.6f, raster_width, raster_height, raster_buffer);
+    RasterizeStroke(stroke_points,
+                    *stroke_transmit_length,
+                    0.6f, 0.6f,
+                    raster_width,
+                    raster_height,
+                    raster_buffer);
     for (int y = 0; y < raster_height; ++y) {
       char line[raster_width + 1];
       for (int x = 0; x < raster_width; ++x) {
@@ -702,6 +728,6 @@ void loop() {
         max_index = i;
       }
     }
-    // TF_LITE_REPORT_ERROR(error_reporter, "Found %s (%d)", labels[max_index], max_score);
+    Serial.printf("Found %s (%d)\n", labels[max_index], max_score);
   }
 }
