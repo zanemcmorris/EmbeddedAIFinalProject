@@ -1,31 +1,18 @@
-/* Copyright 2020 The TensorFlow Authors. All Rights Reserved.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-
-// #ifdef ARDUINO
-// #undef ARDUINO
-// #endif
+/* ESP32 + LSM6DSOX + Magic Wand
+ *  - Gyro-based orientation
+ *  - Time-corrected integration
+ *  - Simple 2D projection (orientation_x, orientation_y)
+ *  - Debug for IsMoving() and stroke ranges
+ */
 
 #include <ArduinoBLE.h>
-// #include <TensorFlowLite_ESP32.h>
 #include <Chirale_TensorFlowLite.h>
 
-// #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/compatibility.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/micro/kernels/micro_ops.h"
-// #include "tensorflow/lite/version.h"
 
 #include "magic_wand_model_data.h"
 #include "rasterize_stroke.h"
@@ -39,146 +26,120 @@ namespace {
 
 const int VERSION = 0x00000000;
 
-constexpr int stroke_transmit_stride = 2;
+constexpr int stroke_transmit_stride     = 2;
 constexpr int stroke_transmit_max_length = 160;
-constexpr int stroke_max_length = stroke_transmit_max_length * stroke_transmit_stride;
-constexpr int stroke_points_byte_count = 2 * sizeof(int8_t) * stroke_transmit_max_length;
-constexpr int stroke_struct_byte_count = (2 * sizeof(int32_t)) + stroke_points_byte_count;
-constexpr int moving_sample_count = 50;
+constexpr int stroke_max_length          = stroke_transmit_max_length * stroke_transmit_stride;
+constexpr int stroke_points_byte_count   = 2 * sizeof(int8_t) * stroke_transmit_max_length;
+constexpr int stroke_struct_byte_count   = (2 * sizeof(int32_t)) + stroke_points_byte_count;
+constexpr int moving_sample_count        = 50;
 
-constexpr int raster_width = 32;
-constexpr int raster_height = 32;
+constexpr int raster_width    = 32;
+constexpr int raster_height   = 32;
 constexpr int raster_channels = 3;
 constexpr int raster_byte_count = raster_height * raster_width * raster_channels;
 int8_t raster_buffer[raster_byte_count];
-float stroke_accel_norm[stroke_transmit_max_length] = {};
+float  stroke_accel_norm[stroke_transmit_max_length] = {};
 
+BLEService       service(BLE_SENSE_UUID("0000"));
+BLECharacteristic strokeCharacteristic(BLE_SENSE_UUID("300a"),
+                                       BLERead,
+                                       stroke_struct_byte_count);
 
-BLEService service(BLE_SENSE_UUID("0000"));
-BLECharacteristic strokeCharacteristic(BLE_SENSE_UUID("300a"), BLERead, stroke_struct_byte_count);
-
-// String to calculate the local and device name
+// BLE name
 String name;
 
-// A buffer holding the last 600 sets of 3-channel values from the accelerometer.
+// Accel buffer (most recent 600 accel triples)
 constexpr int acceleration_data_length = 600 * 3;
 float acceleration_data[acceleration_data_length] = {};
-// The next free entry in the data array.
-int acceleration_data_index = 0;
-float acceleration_sample_rate = 104.0f;
+int   acceleration_data_index = 0;
 
-// A buffer holding the last 600 sets of 3-channel values from the gyroscope.
+// Gyro + orientation buffer (most recent 600 gyro/orientation triples)
 constexpr int gyroscope_data_length = 600 * 3;
-float gyroscope_data[gyroscope_data_length] = {};
+float gyroscope_data[gyroscope_data_length]   = {};
 float orientation_data[gyroscope_data_length] = {};
-// The next free entry in the data array.
-int gyroscope_data_index = 0;
-float gyroscope_sample_rate = 104.0f;
+int   gyroscope_data_index = 0;
 
-float current_velocity[3] = { 0.0f, 0.0f, 0.0f };
-float current_position[3] = { 0.0f, 0.0f, 0.0f };
-float current_gravity[3] = { 0.0f, 0.0f, 0.0f };
-float current_gyroscope_drift[3] = { 0.0f, 0.0f, 0.0f };
+// Nominal sample rate + timing state
+float    gyroscope_sample_rate = 104.0f; // fallback only
+uint32_t last_gyro_time_ms     = 0;
+
+float current_velocity[3]        = {0.0f, 0.0f, 0.0f};
+float current_position[3]        = {0.0f, 0.0f, 0.0f};
+float current_gravity[3]         = {0.0f, 0.0f, 0.0f};
+float current_gyroscope_drift[3] = {0.0f, 0.0f, 0.0f};
 
 int32_t stroke_length = 0;
 uint8_t stroke_struct_buffer[stroke_struct_byte_count] = {};
-int32_t* stroke_state = reinterpret_cast<int32_t*>(stroke_struct_buffer);
+int32_t* stroke_state           = reinterpret_cast<int32_t*>(stroke_struct_buffer);
 int32_t* stroke_transmit_length = reinterpret_cast<int32_t*>(stroke_struct_buffer + sizeof(int32_t));
-int8_t* stroke_points = reinterpret_cast<int8_t*>(stroke_struct_buffer + (sizeof(int32_t) * 2));
+int8_t*  stroke_points          = reinterpret_cast<int8_t*>(stroke_struct_buffer + (sizeof(int32_t) * 2));
 
 enum {
   eWaiting = 0,
   eDrawing = 1,
-  eDone = 2,
+  eDone    = 2,
 };
 
-// Create an area of memory to use for input, output, and intermediate arrays.
-// The size of this will depend on the model you're using, and may need to be
-// determined by experimentation.
+// TFLM
 constexpr int kTensorArenaSize = 30 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
-// tflite::ErrorReporter* error_reporter = nullptr;
-const tflite::Model* model = nullptr;
+const tflite::Model*      model       = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 
 constexpr int label_count = 10;
-const char* labels[label_count] = { "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+const char* labels[label_count] = { "0","1","2","3","4","5","6","7","8","9" };
 
-int ReadAccelerometerAndGyroscope(int maxSamples, int* new_accelerometer_samples, int* new_gyroscope_samples) {
-  // Keep track of whether we stored any new data
+// ---------------------------------------------------------------------------
+// SENSOR READING
+// ---------------------------------------------------------------------------
+
+int ReadAccelerometerAndGyroscope(int maxSamples,
+                                  int* new_accelerometer_samples,
+                                  int* new_gyroscope_samples) {
   *new_accelerometer_samples = 0;
-  *new_gyroscope_samples = 0;
-  // Loop through new samples and add to buffer
-  uint8_t numFifoSamples = 0;
+  *new_gyroscope_samples     = 0;
+
+  uint8_t     numFifoSamples = 0;
   fifoSample_t rawFifoSample;
   fifoSample_t fifoSamples[3];
 
   for (int i = 0; i < maxSamples; i++) {
     uint16_t fifoSize = getFIFOSize();
-    // Serial.printf("fifo size: %d\n", fifoSize);
+    if (fifoSize == 0) break;
 
+    // Read one raw 7-byte FIFO word (tag + payload)
     readFIFONoDecode(&rawFifoSample, 1);
+
     if (isGyroData(&rawFifoSample)) {
-      // Serial.printf("TAG %02X RAW: %02X %02X %02X\n",
-      //               rawFifoSample.tag, rawFifoSample.x, rawFifoSample.y, rawFifoSample.z);
-
-
       numFifoSamples = decodeFifoWord(&rawFifoSample, fifoSamples, 3);
-      // Serial.printf("Got %d gyro samples from decoding FIFO word\n", numFifoSamples);
-      for (int i = 0; i < numFifoSamples; i++) {
-        // Now parse up to three values from fifoSamples into the current_x_data array
-        int gyroscope_index = (gyroscope_data_index % gyroscope_data_length);
+      for (int k = 0; k < numFifoSamples; k++) {
+        int gyro_index = (gyroscope_data_index % gyroscope_data_length);
         gyroscope_data_index += 3;
-        // Serial.printf("Gyro indexing at %d\n", gyroscope_index);
-        float* current_gyroscope_data = &gyroscope_data[gyroscope_index];
-        processSample(fifoSamples[i], current_gyroscope_data);
-        *new_gyroscope_samples += 1;
+        float* current_gyro = &gyroscope_data[gyro_index];
+        processSample(fifoSamples[k], current_gyro);
+        (*new_gyroscope_samples)++;
       }
     } else if (isAccelData(&rawFifoSample)) {
-
       numFifoSamples = decodeFifoWord(&rawFifoSample, fifoSamples, 3);
-      // Serial.printf("Got %d accel samples from decoding FIFO word\n", numFifoSamples);
-      for (int i = 0; i < numFifoSamples; i++) {
-        const int acceleration_index = (acceleration_data_index % acceleration_data_length);
+      for (int k = 0; k < numFifoSamples; k++) {
+        int accel_index = (acceleration_data_index % acceleration_data_length);
         acceleration_data_index += 3;
-        float* current_acceleration_data = &acceleration_data[acceleration_index];
-        processSample(fifoSamples[i], current_acceleration_data);
-        *new_accelerometer_samples += 1;
+        float* current_accel = &acceleration_data[accel_index];
+        processSample(fifoSamples[k], current_accel);
+        (*new_accelerometer_samples)++;
       }
     } else {
-      // Serial.println("Fifo data is not gyro or accel...");
+      // other tags ignored
     }
   }
-  // Serial.println("Read max samples");
-  // if (*new_gyroscope_samples > 0) {
-  //   Serial.printf("Last gyro triple: %.2f %.2f %.2f\n",
-  //                 gyroscope_data[(gyroscope_data_index - 3 + gyroscope_data_length) % gyroscope_data_length],
-  //                 gyroscope_data[(gyroscope_data_index - 2 + gyroscope_data_length) % gyroscope_data_length],
-  //                 gyroscope_data[(gyroscope_data_index - 1 + gyroscope_data_length) % gyroscope_data_length]);
-  // }
-
-  // if (*new_accelerometer_samples > 0) {
-  //   Serial.printf("Last accel triple: %.2f %.2f %.2f\n",
-  //                 acceleration_data[(acceleration_data_index - 3 + acceleration_data_length) % acceleration_data_length],
-  //                 acceleration_data[(acceleration_data_index - 2 + acceleration_data_length) % acceleration_data_length],
-  //                 acceleration_data[(acceleration_data_index - 1 + acceleration_data_length) % acceleration_data_length]);
-  // }
-
-  // if (*new_gyroscope_samples > 0 && *new_accelerometer_samples > 0) {
-  //   Serial.printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f \n",
-  //                 acceleration_data[(acceleration_data_index - 3 + acceleration_data_length) % acceleration_data_length],
-  //                 acceleration_data[(acceleration_data_index - 2 + acceleration_data_length) % acceleration_data_length],
-  //                 acceleration_data[(acceleration_data_index - 1 + acceleration_data_length) % acceleration_data_length],
-  //                 gyroscope_data[(gyroscope_data_index - 3 + gyroscope_data_length) % gyroscope_data_length],
-  //                 gyroscope_data[(gyroscope_data_index - 2 + gyroscope_data_length) % gyroscope_data_length],
-  //                 gyroscope_data[(gyroscope_data_index - 1 + gyroscope_data_length) % gyroscope_data_length]);
-  // }
-
 
   return 1;
 }
 
+// ---------------------------------------------------------------------------
+// MATH HELPERS
+// ---------------------------------------------------------------------------
 
 float VectorMagnitude(const float* vec) {
   const float x = vec[0];
@@ -198,7 +159,7 @@ void NormalizeVector(const float* in_vec, float* out_vec) {
 }
 
 float DotProduct(const float* a, const float* b) {
-  return (a[0] * b[0], a[1] * b[1], a[2] * b[2]);
+  return (a[0] * b[0]) + (a[1] * b[1]) + (a[2] * b[2]);
 }
 
 void EstimateGravityDirection(float* gravity) {
@@ -207,7 +168,10 @@ void EstimateGravityDirection(float* gravity) {
     samples_to_average = acceleration_data_index;
   }
 
-  const int start_index = ((acceleration_data_index + (acceleration_data_length - (3 * (samples_to_average + 1)))) % acceleration_data_length);
+  const int start_index =
+      ((acceleration_data_index +
+        (acceleration_data_length - (3 * (samples_to_average + 1))))
+       % acceleration_data_length);
 
   float x_total = 0.0f;
   float y_total = 0.0f;
@@ -215,12 +179,9 @@ void EstimateGravityDirection(float* gravity) {
   for (int i = 0; i < samples_to_average; ++i) {
     const int index = ((start_index + (i * 3)) % acceleration_data_length);
     const float* entry = &acceleration_data[index];
-    const float x = entry[0];
-    const float y = entry[1];
-    const float z = entry[2];
-    x_total += x;
-    y_total += y;
-    z_total += z;
+    x_total += entry[0];
+    y_total += entry[1];
+    z_total += entry[2];
   }
   gravity[0] = x_total / samples_to_average;
   gravity[1] = y_total / samples_to_average;
@@ -228,11 +189,14 @@ void EstimateGravityDirection(float* gravity) {
 }
 
 void UpdateVelocity(int new_samples, float* gravity) {
-  const float gravity_x = gravity[0];
-  const float gravity_y = gravity[1];
-  const float gravity_z = gravity[2];
+  const float gx = gravity[0];
+  const float gy = gravity[1];
+  const float gz = gravity[2];
 
-  const int start_index = ((acceleration_data_index + (acceleration_data_length - (3 * (new_samples + 1)))) % acceleration_data_length);
+  const int start_index =
+      ((acceleration_data_index +
+        (acceleration_data_length - (3 * (new_samples + 1))))
+       % acceleration_data_length);
 
   const float friction_fudge = 0.98f;
 
@@ -243,22 +207,18 @@ void UpdateVelocity(int new_samples, float* gravity) {
     const float ay = entry[1];
     const float az = entry[2];
 
-    // Try to remove gravity from the raw acceleration values.
-    const float ax_minus_gravity = ax - gravity_x;
-    const float ay_minus_gravity = ay - gravity_y;
-    const float az_minus_gravity = az - gravity_z;
+    const float ax_minus_g = ax - gx;
+    const float ay_minus_g = ay - gy;
+    const float az_minus_g = az - gz;
 
-    // Update velocity based on the normalized acceleration.
-    current_velocity[0] += ax_minus_gravity;
-    current_velocity[1] += ay_minus_gravity;
-    current_velocity[2] += az_minus_gravity;
+    current_velocity[0] += ax_minus_g;
+    current_velocity[1] += ay_minus_g;
+    current_velocity[2] += az_minus_g;
 
-    // Dampen the velocity slightly with a fudge factor to stop it exploding.
     current_velocity[0] *= friction_fudge;
     current_velocity[1] *= friction_fudge;
     current_velocity[2] *= friction_fudge;
 
-    // Update the position estimate based on the velocity.
     current_position[0] += current_velocity[0];
     current_position[1] += current_velocity[1];
     current_position[2] += current_velocity[2];
@@ -276,7 +236,10 @@ void EstimateGyroscopeDrift(float* drift) {
     samples_to_average = gyroscope_data_index;
   }
 
-  const int start_index = ((gyroscope_data_index + (gyroscope_data_length - (3 * (samples_to_average + 1)))) % gyroscope_data_length);
+  const int start_index =
+      ((gyroscope_data_index +
+        (gyroscope_data_length - (3 * (samples_to_average + 1))))
+       % gyroscope_data_length);
 
   float x_total = 0.0f;
   float y_total = 0.0f;
@@ -284,29 +247,30 @@ void EstimateGyroscopeDrift(float* drift) {
   for (int i = 0; i < samples_to_average; ++i) {
     const int index = ((start_index + (i * 3)) % gyroscope_data_length);
     const float* entry = &gyroscope_data[index];
-    const float x = entry[0];
-    const float y = entry[1];
-    const float z = entry[2];
-    x_total += x;
-    y_total += y;
-    z_total += z;
+    x_total += entry[0];
+    y_total += entry[1];
+    z_total += entry[2];
   }
   drift[0] = x_total / samples_to_average;
   drift[1] = y_total / samples_to_average;
   drift[2] = z_total / samples_to_average;
 }
 
-void UpdateOrientation(int new_samples, float* gravity, float* drift) {
+// NEW: use dt_per_sample_sec instead of fixed sample rate
+void UpdateOrientation(int new_samples,
+                       float* /*gravity*/,
+                       float* drift,
+                       float dt_per_sample_sec) {
   const float drift_x = drift[0];
   const float drift_y = drift[1];
   const float drift_z = drift[2];
 
-  const int start_index = ((gyroscope_data_index + (gyroscope_data_length - (3 * new_samples))) % gyroscope_data_length);
+  const int start_index =
+      ((gyroscope_data_index +
+        (gyroscope_data_length - (3 * new_samples)))
+       % gyroscope_data_length);
 
-  // The gyroscope values are in degrees-per-second, so to approximate
-  // degrees in the integrated orientation, we need to divide each value
-  // by the number of samples each second.
-  const float recip_sample_rate = 1.0f / gyroscope_sample_rate;
+  const float dt = dt_per_sample_sec;
 
   for (int i = 0; i < new_samples; ++i) {
     const int index = ((start_index + (i * 3)) % gyroscope_data_length);
@@ -315,41 +279,47 @@ void UpdateOrientation(int new_samples, float* gravity, float* drift) {
     const float dy = entry[1];
     const float dz = entry[2];
 
-    // Try to remove sensor errors from the raw gyroscope values.
     const float dx_minus_drift = dx - drift_x;
     const float dy_minus_drift = dy - drift_y;
     const float dz_minus_drift = dz - drift_z;
 
-    // Convert from degrees-per-second to appropriate units for this
-    // time interval.
-    const float dx_normalized = dx_minus_drift * recip_sample_rate;
-    const float dy_normalized = dy_minus_drift * recip_sample_rate;
-    const float dz_normalized = dz_minus_drift * recip_sample_rate;
+    const float dx_delta = dx_minus_drift * dt; // deg
+    const float dy_delta = dy_minus_drift * dt;
+    const float dz_delta = dz_minus_drift * dt;
 
-    // Update orientation based on the gyroscope data.
     float* current_orientation = &orientation_data[index];
-    const int previous_index = (index + (gyroscope_data_length - 3)) % gyroscope_data_length;
+    const int previous_index =
+        (index + (gyroscope_data_length - 3)) % gyroscope_data_length;
     const float* previous_orientation = &orientation_data[previous_index];
-    current_orientation[0] = previous_orientation[0] + dx_normalized;
-    current_orientation[1] = previous_orientation[1] + dy_normalized;
-    current_orientation[2] = previous_orientation[2] + dz_normalized;
+
+    current_orientation[0] = previous_orientation[0] + dx_delta;
+    current_orientation[1] = previous_orientation[1] + dy_delta;
+    current_orientation[2] = previous_orientation[2] + dz_delta;
   }
 }
 
+// ---------------------------------------------------------------------------
+// IsMoving() with debug
+// ---------------------------------------------------------------------------
+
 bool IsMoving(int samples_before) {
-  constexpr float moving_threshold = 10.0f;
+  constexpr float moving_threshold = 5.0f;  // tuned from your logs
 
   if ((gyroscope_data_index - samples_before) < moving_sample_count) {
     return false;
   }
 
-  const int start_index = ((gyroscope_data_index + (gyroscope_data_length - (3 * (moving_sample_count + samples_before)))) % gyroscope_data_length);
+  const int start_index =
+      ((gyroscope_data_index +
+        (gyroscope_data_length - (3 * (moving_sample_count + samples_before))))
+       % gyroscope_data_length);
 
   float total = 0.0f;
   for (int i = 0; i < moving_sample_count; ++i) {
     const int index = ((start_index + (i * 3)) % gyroscope_data_length);
     float* current_orientation = &orientation_data[index];
-    const int previous_index = (index + (gyroscope_data_length - 3)) % gyroscope_data_length;
+    const int previous_index =
+        (index + (gyroscope_data_length - 3)) % gyroscope_data_length;
     const float* previous_orientation = &orientation_data[previous_index];
     const float dx = current_orientation[0] - previous_orientation[0];
     const float dy = current_orientation[1] - previous_orientation[1];
@@ -357,20 +327,35 @@ bool IsMoving(int samples_before) {
     const float mag_squared = (dx * dx) + (dy * dy) + (dz * dz);
     total += mag_squared;
   }
+
+  // DEBUG: print occasionally
+  static uint32_t last_print = 0;
+  uint32_t now = millis();
+  if (now - last_print > 100) {
+    Serial.printf("IsMoving total=%.3f (threshold=%.3f)\n",
+                  total, moving_threshold);
+    last_print = now;
+  }
+
   const bool is_moving = (total > moving_threshold);
   return is_moving;
 }
 
+// ---------------------------------------------------------------------------
+// Stroke update with SIMPLE 2D PROJECTION + debug
+// ---------------------------------------------------------------------------
+
 void UpdateStroke(int new_samples, bool* done_just_triggered) {
-  constexpr int minimum_stroke_length = moving_sample_count + 10;
-  constexpr float minimum_stroke_size = 0.2f;
+  constexpr int   minimum_stroke_length = 60;    // tuned with your len ~100–130
+  constexpr float minimum_stroke_size   = 0.05f; // reject only tiny jitters
 
   *done_just_triggered = false;
 
   for (int i = 0; i < new_samples; ++i) {
     const int current_head = (new_samples - (i + 1));
-    const bool is_moving = IsMoving(current_head);
+    const bool is_moving   = IsMoving(current_head);
     const int32_t old_state = *stroke_state;
+
     if ((old_state == eWaiting) || (old_state == eDone)) {
       if (is_moving) {
         stroke_length = moving_sample_count;
@@ -397,14 +382,17 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
       stroke_length = stroke_max_length;
     }
 
-    // Only recalculate the full stroke if it's needed.
-    const bool draw_last_point = ((i == (new_samples - 1)) && (*stroke_state == eDrawing));
+    const bool draw_last_point =
+        ((i == (new_samples - 1)) && (*stroke_state == eDrawing));
     *done_just_triggered = ((old_state != eDone) && (*stroke_state == eDone));
     if (!(*done_just_triggered || draw_last_point)) {
       continue;
     }
 
-    const int start_index = ((gyroscope_data_index + (gyroscope_data_length - (3 * (stroke_length + current_head)))) % gyroscope_data_length);
+    const int start_index =
+        ((gyroscope_data_index +
+          (gyroscope_data_length - (3 * (stroke_length + current_head))))
+         % gyroscope_data_length);
 
     float x_total = 0.0f;
     float y_total = 0.0f;
@@ -420,201 +408,170 @@ void UpdateStroke(int new_samples, bool* done_just_triggered) {
     const float x_mean = x_total / stroke_length;
     const float y_mean = y_total / stroke_length;
     const float z_mean = z_total / stroke_length;
-    constexpr float range = 90.0f;
+    (void)z_mean;
 
-    const float gy = current_gravity[1];
-    const float gz = current_gravity[2];
-    float gmag = sqrtf((gy * gy) + (gz * gz));
-    if (gmag < 0.0001f) {
-      gmag = 0.0001f;
-    }
-    const float ngy = gy / gmag;
-    const float ngz = gz / gmag;
-
-    const float xaxisz = -ngz;
-    const float xaxisy = -ngy;
-
-    const float yaxisz = -ngy;
-    const float yaxisy = ngz;
+    // zoom in based on your ranges
+    constexpr float range = 30.0f; // degrees
 
     *stroke_transmit_length = stroke_length / stroke_transmit_stride;
 
-    constexpr float accel_low = 0.0f;
-    constexpr float accel_high = 16000.0f;  // Accel is configured at 16g full scale
+    constexpr float accel_low  = 0.0f;
+    constexpr float accel_high = 16000.0f;  // mg at 16g full-scale
 
-    float x_min;
-    float y_min;
-    float x_max;
-    float y_max;
+    float x_min = 0.0f, y_min = 0.0f, x_max = 0.0f, y_max = 0.0f;
+
     for (int j = 0; j < *stroke_transmit_length; ++j) {
-      const int orientation_index = ((start_index + ((j * stroke_transmit_stride) * 3)) % gyroscope_data_length);
+      const int orientation_index =
+          ((start_index + ((j * stroke_transmit_stride) * 3))
+           % gyroscope_data_length);
       const float* orientation_entry = &orientation_data[orientation_index];
 
       const float orientation_x = orientation_entry[0];
       const float orientation_y = orientation_entry[1];
       const float orientation_z = orientation_entry[2];
+      (void)orientation_z;
 
-      const float nx = (orientation_x - x_mean) / range;
-      const float ny = (orientation_y - y_mean) / range;
-      const float nz = (orientation_z - z_mean) / range;
-
-      const float x_axis = (xaxisz * nz) + (xaxisy * ny);
-      const float y_axis = (yaxisz * nz) + (yaxisy * ny);
+      // SIMPLE 2D PROJECTION: directly from orientation_x / orientation_y
+      const float x_axis = (orientation_x - x_mean) / range;
+      const float y_axis = (orientation_y - y_mean) / range;
 
       const int stroke_index = j * 2;
-      int8_t* stroke_entry = &stroke_points[stroke_index];
+      int8_t* stroke_entry   = &stroke_points[stroke_index];
 
       int32_t unchecked_x = static_cast<int32_t>(roundf(x_axis * 128.0f));
       int8_t stored_x;
-      if (unchecked_x > 127) {
-        stored_x = 127;
-      } else if (unchecked_x < -128) {
-        stored_x = -128;
-      } else {
-        stored_x = unchecked_x;
-      }
+      if (unchecked_x > 127) stored_x = 127;
+      else if (unchecked_x < -128) stored_x = -128;
+      else stored_x = (int8_t)unchecked_x;
       stroke_entry[0] = stored_x;
 
       int32_t unchecked_y = static_cast<int32_t>(roundf(y_axis * 128.0f));
       int8_t stored_y;
-      if (unchecked_y > 127) {
-        stored_y = 127;
-      } else if (unchecked_y < -128) {
-        stored_y = -128;
-      } else {
-        stored_y = unchecked_y;
-      }
+      if (unchecked_y > 127) stored_y = 127;
+      else if (unchecked_y < -128) stored_y = -128;
+      else stored_y = (int8_t)unchecked_y;
       stroke_entry[1] = stored_y;
 
       const bool is_first = (j == 0);
-      if (is_first || (x_axis < x_min)) {
-        x_min = x_axis;
-      }
-      if (is_first || (y_axis < y_min)) {
-        y_min = y_axis;
-      }
-      if (is_first || (x_axis > x_max)) {
-        x_max = x_axis;
-      }
-      if (is_first || (y_axis > y_max)) {
-        y_max = y_axis;
-      }
+      if (is_first || (x_axis < x_min)) x_min = x_axis;
+      if (is_first || (y_axis < y_min)) y_min = y_axis;
+      if (is_first || (x_axis > x_max)) x_max = x_axis;
+      if (is_first || (y_axis > y_max)) y_max = y_axis;
 
-      const int accel_start_index = ((acceleration_data_index + (acceleration_data_length - (3 * (stroke_length + current_head))))
-                                     % acceleration_data_length);
-
-      const int accel_index = (accel_start_index + ((j * stroke_transmit_stride) * 3)) % acceleration_data_length;
+      const int accel_start_index =
+          ((acceleration_data_index +
+            (acceleration_data_length - (3 * (stroke_length + current_head))))
+           % acceleration_data_length);
+      const int accel_index =
+          (accel_start_index + ((j * stroke_transmit_stride) * 3))
+          % acceleration_data_length;
 
       const float* accel_entry = &acceleration_data[accel_index];
-      const float ax = accel_entry[0];  // mg
+      const float ax = accel_entry[0];
       const float ay = accel_entry[1];
       const float az = accel_entry[2];
 
-      float mag = sqrtf(ax * ax + ay * ay + az * az);  // mg
-
-      // Normalize 0..1 between accel_low and accel_high
+      float mag = sqrtf(ax * ax + ay * ay + az * az); // mg
       float norm = (mag - accel_low) / (accel_high - accel_low);
       if (norm < 0.0f) norm = 0.0f;
       if (norm > 1.0f) norm = 1.0f;
 
-      stroke_accel_norm[j] = norm;  // one intensity per stroke point
+      stroke_accel_norm[j] = norm;
     }
 
-    // If the stroke is too small, cancel it.
     if (*done_just_triggered) {
-      Serial.printf("Stroke DONE! stroke_length=%ld, tx_len=%ld\n",
-                    stroke_length, *stroke_transmit_length);
-      const float x_range = (x_max - x_min);
-      const float y_range = (y_max - y_min);
+      const float x_range = x_max - x_min;
+      const float y_range = y_max - y_min;
+
+      Serial.printf("Stroke DONE len=%ld, tx_len=%ld, x_range=%.3f, y_range=%.3f\n",
+                    stroke_length, *stroke_transmit_length,
+                    x_range, y_range);
+
       if ((x_range < minimum_stroke_size) && (y_range < minimum_stroke_size)) {
-        *done_just_triggered = false;
-        *stroke_state = eWaiting;
-        *stroke_transmit_length = 0;
-        stroke_length = 0;
+        Serial.println("Stroke rejected: too small.");
+        *done_just_triggered     = false;
+        *stroke_state            = eWaiting;
+        *stroke_transmit_length  = 0;
+        stroke_length            = 0;
       }
     }
   }
 }
 
-}  // namespace
+// ---------------------------------------------------------------------------
+// TFLITE SETUP
+// ---------------------------------------------------------------------------
 
 void setup_tflite() {
-  // Set up logging. Google style is to avoid globals or statics because of
-  // lifetime uncertainty, but since this has a trivial destructor it's okay.
-  // static tflite::MicroErrorReporter micro_error_reporter;  // NOLINT
-  // error_reporter = &micro_error_reporter;
-
-  // Map the model into a usable data structure. This doesn't involve any
-  // copying or parsing, it's a very lightweight operation.
   model = tflite::GetModel(g_magic_wand_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    // TF_LITE_REPORT_ERROR(error_reporter,
-    //                      "Model provided is schema version %d not equal "
-    //                      "to supported version %d.",
-    //                      model->version(), TFLITE_SCHEMA_VERSION);
-    Serial.println("Model version provided is not good");
+    Serial.println("Model version mismatch");
     return;
   }
 
-  // Pull in only the operation implementations we need.
-  // This relies on a complete list of all the ops needed by this graph.
-  // An easier approach is to just use the AllOpsResolver, but this will
-  // incur some penalty in code space for op implementations that are not
-  // needed by this graph.
-  static tflite::MicroMutableOpResolver<4> micro_op_resolver;  // NOLINT
-
+  static tflite::MicroMutableOpResolver<4> micro_op_resolver;
   micro_op_resolver.AddConv2D();
   micro_op_resolver.AddMean();
   micro_op_resolver.AddFullyConnected();
   micro_op_resolver.AddSoftmax();
 
-  // Build an interpreter to run the model with.
   static tflite::MicroInterpreter static_interpreter(
-    model, micro_op_resolver, tensor_arena, kTensorArenaSize);  // Had errorReporter memaddr as final arg
+      model, micro_op_resolver, tensor_arena, kTensorArenaSize);
   interpreter = &static_interpreter;
 
-  // Allocate memory from the tensor_arena for the model's tensors.
-  interpreter->AllocateTensors();
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("AllocateTensors failed");
+    return;
+  }
 
   TfLiteTensor* model_input = interpreter->input(0);
-  if ((model_input->dims->size != 4) || (model_input->dims->data[0] != 1) || (model_input->dims->data[1] != raster_height) || (model_input->dims->data[2] != raster_width) || (model_input->dims->data[3] != raster_channels) || (model_input->type != kTfLiteInt8)) {
-    // TF_LITE_REPORT_ERROR(error_reporter,
-    //                      "Bad input tensor parameters in model");
-    Serial.println("Bad input tensor parameters in model");
+  if ((model_input->dims->size   != 4) ||
+      (model_input->dims->data[0]!= 1) ||
+      (model_input->dims->data[1]!= raster_height) ||
+      (model_input->dims->data[2]!= raster_width) ||
+      (model_input->dims->data[3]!= raster_channels) ||
+      (model_input->type         != kTfLiteInt8)) {
+    Serial.println("Bad input tensor params");
     return;
   }
 
   TfLiteTensor* model_output = interpreter->output(0);
-  if ((model_output->dims->size != 2) || (model_output->dims->data[0] != 1) || (model_output->dims->data[1] != label_count) || (model_output->type != kTfLiteInt8)) {
-    // TF_LITE_REPORT_ERROR(error_reporter,
-    //                      "Bad output tensor parameters in model");
-    Serial.println("Bad output tensor parameters in model");
+  if ((model_output->dims->size   != 2) ||
+      (model_output->dims->data[0]!= 1) ||
+      (model_output->dims->data[1]!= label_count) ||
+      (model_output->type         != kTfLiteInt8)) {
+    Serial.println("Bad output tensor params");
     return;
   }
 }
 
+} // namespace
+
+// ---------------------------------------------------------------------------
+// ARDUINO SETUP / LOOP
+// ---------------------------------------------------------------------------
+
 void setup() {
   Serial.begin(115200);
   delay(200);
+  Serial.println("ESP32 Magic Wand (gyro + debug) starting...");
 
-  Serial.println("Started");
-
-  startIMU(104u);
+  if (!startIMU(104u)) {
+    Serial.println("startIMU FAILED");
+    while (1) { delay(1000); }
+  }
 
   if (!BLE.begin()) {
-    Serial.println("Failed to initialized BLE!");
-    while (1)
-      ;
+    Serial.println("BLE init failed");
+    while (1) { delay(1000); }
   }
 
   String address = BLE.address();
-
   Serial.print("address = ");
   Serial.println(address);
-
   address.toUpperCase();
 
-  name = "BLESense-";
+  name  = "BLESense-";
   name += address[address.length() - 5];
   name += address[address.length() - 4];
   name += address[address.length() - 2];
@@ -628,48 +585,69 @@ void setup() {
   BLE.setAdvertisedService(service);
 
   service.addCharacteristic(strokeCharacteristic);
-
   BLE.addService(service);
-
   BLE.advertise();
+
+  *stroke_state           = eWaiting;
+  *stroke_transmit_length = 0;
+  stroke_length           = 0;
 
   setup_tflite();
 }
 
 void loop() {
-  // Serial.println("At the top of the loop!");
   BLEDevice central = BLE.central();
 
-  // if a central is connected to the peripheral:
   static bool was_connected_last = false;
   if (central && !was_connected_last) {
     Serial.print("Connected to central: ");
-    // print the central's BT address:
     Serial.println(central.address());
   }
   was_connected_last = central;
 
-  // Serial.println("Checking for avail...");
   uint16_t numSamplesInFifo = getFIFOSize();
   if (numSamplesInFifo == 0) {
-    // Serial.println("No fifo samples available... exiting early.");
     return;
   }
 
-  int accelerometer_samples_read;
-  int gyroscope_samples_read;
-  // Serial.println("reading stufff....");
-  uint32_t startTime = millis();
-  ReadAccelerometerAndGyroscope(100, &accelerometer_samples_read, &gyroscope_samples_read);
-  // Serial.printf("Got data in %lu ms\n", millis() - startTime);
+  int accelerometer_samples_read = 0;
+  int gyroscope_samples_read     = 0;
+
+  ReadAccelerometerAndGyroscope(100,
+                                &accelerometer_samples_read,
+                                &gyroscope_samples_read);
 
   bool done_just_triggered = false;
+
   if (gyroscope_samples_read > 0) {
+    uint32_t now = millis();
+
+    float dt_total_ms;
+    if (last_gyro_time_ms == 0) {
+      dt_total_ms = (1000.0f / gyroscope_sample_rate);
+    } else {
+      dt_total_ms = (float)(now - last_gyro_time_ms);
+      if (dt_total_ms <= 0.0f) {
+        dt_total_ms = (1000.0f / gyroscope_sample_rate);
+      }
+    }
+    last_gyro_time_ms = now;
+
+    float dt_per_sample = (dt_total_ms / 1000.0f) / gyroscope_samples_read;
+    if (dt_per_sample <= 0.0f || dt_per_sample > 0.1f) {
+      dt_per_sample = 1.0f / gyroscope_sample_rate;
+    }
+
     EstimateGyroscopeDrift(current_gyroscope_drift);
-    UpdateOrientation(gyroscope_samples_read, current_gravity, current_gyroscope_drift);
+    UpdateOrientation(gyroscope_samples_read,
+                      current_gravity,
+                      current_gyroscope_drift,
+                      dt_per_sample);
     UpdateStroke(gyroscope_samples_read, &done_just_triggered);
+
     if (central && central.connected()) {
-      strokeCharacteristic.writeValue(stroke_struct_buffer, stroke_struct_byte_count);
+      strokeCharacteristic.writeValue(stroke_struct_buffer,
+                                      stroke_struct_byte_count);
     }
   }
 
@@ -678,7 +656,6 @@ void loop() {
     UpdateVelocity(accelerometer_samples_read, current_gravity);
   }
 
-  // Serial.println("here!");
   if (done_just_triggered) {
     RasterizeStroke(stroke_points,
                     *stroke_transmit_length,
@@ -686,19 +663,19 @@ void loop() {
                     raster_width,
                     raster_height,
                     raster_buffer);
+
     for (int y = 0; y < raster_height; ++y) {
       char line[raster_width + 1];
       for (int x = 0; x < raster_width; ++x) {
-        const int8_t* pixel = &raster_buffer[(y * raster_width * raster_channels) + (x * raster_channels)];
-        const int8_t red = pixel[0];
+        const int8_t* pixel =
+            &raster_buffer[(y * raster_width * raster_channels) +
+                           (x * raster_channels)];
+        const int8_t red   = pixel[0];
         const int8_t green = pixel[1];
-        const int8_t blue = pixel[2];
-        char output;
-        if ((red > -128) || (green > -128) || (blue > -128)) {
-          output = '#';
-        } else {
-          output = '.';
-        }
+        const int8_t blue  = pixel[2];
+        char output = ((red > -128) || (green > -128) || (blue > -128))
+                        ? '#'
+                        : '.';
         line[x] = output;
       }
       line[raster_width] = 0;
@@ -712,16 +689,15 @@ void loop() {
 
     TfLiteStatus invoke_status = interpreter->Invoke();
     if (invoke_status != kTfLiteOk) {
-      // TF_LITE_REPORT_ERROR(error_reporter, "Invoke failed");
       Serial.println("Invoke failed");
       return;
     }
 
     TfLiteTensor* output = interpreter->output(0);
 
-    int8_t max_score;
-    int max_index;
-    for (int i = 0; i < 10; ++i) {
+    int8_t max_score = 0;
+    int   max_index  = 0;
+    for (int i = 0; i < label_count; ++i) {
       const int8_t score = output->data.int8[i];
       if ((i == 0) || (score > max_score)) {
         max_score = score;
@@ -729,5 +705,9 @@ void loop() {
       }
     }
     Serial.printf("Found %s (%d)\n", labels[max_index], max_score);
+
+    *stroke_state           = eWaiting;
+    *stroke_transmit_length = 0;
+    stroke_length           = 0;
   }
 }
