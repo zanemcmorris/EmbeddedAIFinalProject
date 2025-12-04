@@ -19,4 +19,8 @@ This is the base code from Pete Warden's magic wand example. It contains all of 
 ### magic_wand_integration
 This is the final piece of software that mates the AI-driven magic wand with the new IMU driver that we developed. When we mention the 'final application', this is it. It contains many files that abstract away some of the IMU functionalities and customizes Pete Warden's example to run on the TinyCore ESP32-S3.
 
+## TinyDisplay
+This directory contains the early PCB designs of the TinyDisplay peripheral we sought to develop. We quickly moved the screen to being out of scope for the project so that we could work on other, more crucial, aspects of the project.
 
+## tinyCore-Main
+This is a clone of the TinyCore repo, which serves as a central location for all the TinyCore documentation, code examples, hardare layout, and more. It is here for quick reference.
