@@ -49,7 +49,7 @@ bool startIMU(uint16_t sensorFreq) {
   write8(REG_FIFO_CTRL4, 0x06);                      // FIFO_CTRL4: 1 = FIFO (stop-when-full), 0x6 = continous & overwrite old data
 
   dumpIMURegisters_Fixed();
-  calibrateIMU(300);
+  // calibrateIMU(300);
 
   return status;
 }
@@ -126,7 +126,6 @@ bool readEmbedded(uint8_t reg, uint8_t &val) {
   return ok && true;
 }
 
-// Optional: write helper for embedded bank if you need it elsewhere
 bool writeEmbedded(uint8_t reg, uint8_t val) {
   if (!write8(REG_FUNC_CFG_ACCESS, 0x80)) return false;
   bool ok = write8(reg, val);
@@ -184,7 +183,6 @@ void dumpIMURegisters_Fixed() {
   rdUI(REG_FIFO_STATUS1, "FIFO_STATUS1");
   rdUI(REG_FIFO_STATUS2, "FIFO_STATUS2");
 
-  // Embedded-functions bank (needs FUNC_CFG_ACCESS.FUNC_CFG_EN=1)
   rdEMB(REG_EMB_FUNC_EN_A, "EMB_FUNC_EN_A");
   rdEMB(REG_EMB_FUNC_EN_B, "EMB_FUNC_EN_B");
   dumpSHUBConfigs();
@@ -494,7 +492,7 @@ void resetAndBypass() {
 }
 
 /**
- * @brief Calibration routine for the IMU at rest. Averages samples over a brief period to compute noise floor
+ * @brief Calibration routine for the IMU at rest. Averages samples over a brief period to compute noise 
  * 
  * @return None
  */
@@ -555,8 +553,8 @@ void calibrateIMU(size_t samples) {
     calib.ax_off = ax_mean;
     calib.ay_off = ay_mean;
     // subtract 1 g worth of LSBs on Z so we keep +1g in az after calibration
-    // calib.az_off = az_mean - (1000.0f / ACC_SENS_16G); // Calib step to KEEP gravity in acceleration
-    calib.az_off = az_mean;  // REMOVE gravity in acceleration
+    calib.az_off = az_mean - (1000.0f / ACC_SENS_16G); // Calib step to KEEP gravity in acceleration
+    // calib.az_off = az_mean;  // REMOVE gravity in acceleration
   } else {
     calib.ax_off = calib.ay_off = calib.az_off = 0;
   }

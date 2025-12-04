@@ -8,6 +8,7 @@
 #define LSM6DSOX_ADDR_6A 0x6A
 #define LSM6DSOX_ADDR_6B 0x6B
 
+
 // Registers
 #define REG_CTRL3_C 0x12
 #define REG_CTRL1_XL 0x10
