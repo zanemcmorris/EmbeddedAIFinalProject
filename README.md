@@ -3,7 +3,7 @@
 The goal of the Swing Sense is to leverage an existing hardware solution (TinyCore) to create a wearable device that can recognize and relay information about the user's golf swings.
 
 # How to run the project
-First, you ought to get your hand on a TinyCore device with an Espressif ESP32-S3 and the STM LSM6DSO IMU. Next, follow the TinyCore documentation for installing the board in the Arduino IDE, the preferred developemt environment for the project. Then, navigate to the magic_wand_integration sketch and upload it to the board. The program will start automatically and start detecting movement strokes and publishing data to the companion webpage. You can view this webpage on a host computer by navigating to /ESP32/magic_wand_integration/website/index.html. From there you should see only one bluetooth device to connect to. Then you should see your movements reflected on the live monitor.
+First, you ought to get your hand on a TinyCore device with an Espressif ESP32-S3 and the STM LSM6DSO IMU. Next, follow the TinyCore documentation for installing the board in the Arduino IDE, the preferred developemt environment for the project. Then, navigate to the magic_wand_integration sketch and upload it to the board. The program will start automatically and start detecting movement strokes and publishing data to the companion webpage. You can view this webpage on a host computer by navigating to /ESP32/magic_wand_integration/website/index.html. From there you should see only one bluetooth device to connect to. Then you should see your movements reflected on the live monitor. AI predictions come over the serial monitor for the TinyCore, with predictions and confidence scores from -127 to 128 for each detected stroke. 
 
 # File Structure
 
